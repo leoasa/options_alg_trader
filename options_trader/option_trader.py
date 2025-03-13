@@ -14,7 +14,7 @@ class OptionTrader:
     Uses Alpaca for paper trading.
     """
     
-    def __init__(self, api_key=None, api_secret=None, base_url=None):
+    def __init__(self, api_key=None, api_secret=None, base_url=None, data_url=None):
         """Initialize the option trader"""
         self.simulation_mode = False
         self.simulated_portfolio = None
@@ -23,16 +23,25 @@ class OptionTrader:
         self.api_key = api_key or os.environ.get('ALPACA_API_KEY')
         self.api_secret = api_secret or os.environ.get('ALPACA_API_SECRET')
         self.base_url = base_url or os.environ.get('ALPACA_API_BASE_URL', 'https://paper-api.alpaca.markets')
+        self.data_url = data_url or os.environ.get('ALPACA_DATA_URL', 'https://data.alpaca.markets')
         
         # Initialize API connection if credentials are available
         if self.api_key and self.api_secret:
             try:
+                print(f"Initializing Alpaca API with base_url: {self.base_url}")
                 self.api = tradeapi.REST(
                     self.api_key,
                     self.api_secret,
                     self.base_url,
                     api_version='v2'
                 )
+                
+                # Test the connection
+                try:
+                    account = self.api.get_account()
+                    print(f"Successfully connected to Alpaca API. Account ID: {account.id}")
+                except Exception as test_error:
+                    print(f"Warning: API initialized but test connection failed: {test_error}")
             except Exception as e:
                 print(f"Error connecting to Alpaca API: {e}")
                 self.api = None

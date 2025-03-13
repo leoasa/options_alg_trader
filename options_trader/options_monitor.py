@@ -56,10 +56,30 @@ class OptionsMonitor:
             # Try to initialize the OptionTrader which contains Alpaca API
             self.trader = OptionTrader()
             self.api = self.trader.api
-            print("Successfully connected to Alpaca API")
+            
+            if self.api:
+                print("Successfully connected to Alpaca API")
+                
+                # Check if we can access the API
+                try:
+                    account = self.api.get_account()
+                    print(f"Connected to Alpaca account: {account.id} (Status: {account.status})")
+                except Exception as account_error:
+                    print(f"Warning: Connected to API but couldn't get account info: {account_error}")
+                
+                # Check if we can access market data
+                try:
+                    clock = self.api.get_clock()
+                    print(f"Market is {'open' if clock.is_open else 'closed'}")
+                except Exception as clock_error:
+                    print(f"Warning: Connected to API but couldn't get market clock: {clock_error}")
+            else:
+                print("Warning: OptionTrader initialized but API object is None")
         except Exception as e:
             print(f"Error connecting to Alpaca API: {e}")
             print("Some features may be limited without API access")
+            self.api = None
+            self.trader = None
     
     def _refresh_loop(self):
         """Background thread to refresh data periodically"""
@@ -102,51 +122,135 @@ class OptionsMonitor:
             timestamp = datetime.now().replace(second=0, microsecond=0)
         
         if not self.api:
+            print(f"No API access for {ticker} stock data")
             return self._create_empty_stock_data()
         
         try:
+            print(f"Fetching stock data for {ticker}...")
+            
             # Get asset information
-            asset = self.api.get_asset(ticker)
+            try:
+                asset = self.api.get_asset(ticker)
+                print(f"Asset info for {ticker}: {asset.symbol}, tradable: {asset.tradable}")
+            except Exception as asset_error:
+                print(f"Error getting asset info for {ticker}: {asset_error}")
+                # Continue anyway, as we might still get price data
             
-            # Get latest bar data
-            bars = self.api.get_bars(ticker, '1Day', limit=1).df
-            if bars.empty:
+            # Try to get latest market data using the Alpaca API
+            try:
+                # First try using the get_bars method
+                print(f"Trying to get bars for {ticker}...")
+                bars = self.api.get_bars(ticker, '1Day', limit=1).df
+                
+                if bars.empty:
+                    print(f"No bar data found for {ticker}, trying alternative method...")
+                    # If no bars, try using the get_latest_trade method if available
+                    if hasattr(self.api, 'get_latest_trade'):
+                        latest_trade = self.api.get_latest_trade(ticker)
+                        print(f"Latest trade for {ticker}: {latest_trade}")
+                        # Create a synthetic bar from the latest trade
+                        stock_data = {
+                            'price': latest_trade.price,
+                            'change': 0,  # We don't have previous data
+                            'volume': latest_trade.size,
+                            'avg_volume': None,
+                            'market_cap': None,
+                            'beta': None,
+                            'pe_ratio': None,
+                            '52w_high': None,
+                            '52w_low': None
+                        }
+                        return stock_data
+                    else:
+                        print(f"No alternative method available for {ticker}")
+                        return self._create_empty_stock_data()
+                
+                print(f"Got bar data for {ticker}: {bars.iloc[-1].to_dict()}")
+                latest_bar = bars.iloc[-1]
+                
+                # Get previous day's close for calculating change
+                try:
+                    yesterday = datetime.now() - timedelta(days=1)
+                    yesterday_bars = self.api.get_bars(ticker, '1Day', 
+                                                    start=yesterday.strftime('%Y-%m-%d'),
+                                                    limit=1).df
+                    prev_close = yesterday_bars.iloc[-1]['close'] if not yesterday_bars.empty else latest_bar['close']
+                    change_pct = ((latest_bar['close'] - prev_close) / prev_close) * 100
+                except Exception as prev_error:
+                    print(f"Error getting previous day data for {ticker}: {prev_error}")
+                    change_pct = 0
+                
+                # Get 52-week high/low
+                try:
+                    year_ago = datetime.now() - timedelta(days=365)
+                    yearly_bars = self.api.get_bars(ticker, '1Day', 
+                                                start=year_ago.strftime('%Y-%m-%d')).df
+                    
+                    high_52w = yearly_bars['high'].max() if not yearly_bars.empty else None
+                    low_52w = yearly_bars['low'].min() if not yearly_bars.empty else None
+                    avg_volume = yearly_bars['volume'].mean() if not yearly_bars.empty else None
+                except Exception as yearly_error:
+                    print(f"Error getting yearly data for {ticker}: {yearly_error}")
+                    high_52w = None
+                    low_52w = None
+                    avg_volume = None
+                
+                # Create stock data dictionary
+                stock_data = {
+                    'price': latest_bar['close'],
+                    'change': change_pct,
+                    'volume': latest_bar['volume'],
+                    'avg_volume': avg_volume,
+                    'market_cap': None,  # Not directly available from Alpaca
+                    'beta': None,  # Not directly available from Alpaca
+                    'pe_ratio': None,  # Not directly available from Alpaca
+                    '52w_high': high_52w,
+                    '52w_low': low_52w
+                }
+                
+                print(f"Successfully fetched stock data for {ticker}: price=${stock_data['price']}")
+                return stock_data
+                
+            except Exception as bars_error:
+                print(f"Error getting bar data for {ticker}: {bars_error}")
+                
+                # Try using direct REST API call as a fallback
+                try:
+                    print(f"Trying direct API call for {ticker}...")
+                    # Use the requests module to make a direct API call
+                    url = f"{self.trader.data_url}/v2/stocks/{ticker}/bars/latest"
+                    headers = {
+                        'APCA-API-KEY-ID': self.trader.api_key,
+                        'APCA-API-SECRET-KEY': self.trader.api_secret
+                    }
+                    
+                    response = requests.get(url, headers=headers)
+                    if response.status_code == 200:
+                        data = response.json()
+                        print(f"Direct API response for {ticker}: {data}")
+                        
+                        if 'bar' in data:
+                            bar = data['bar']
+                            stock_data = {
+                                'price': bar.get('c', None),  # close price
+                                'change': 0,  # We don't have previous data
+                                'volume': bar.get('v', None),  # volume
+                                'avg_volume': None,
+                                'market_cap': None,
+                                'beta': None,
+                                'pe_ratio': None,
+                                '52w_high': None,
+                                '52w_low': None
+                            }
+                            print(f"Successfully fetched stock data via direct API for {ticker}")
+                            return stock_data
+                    
+                    print(f"Direct API call failed for {ticker}: {response.status_code} - {response.text}")
+                except Exception as direct_error:
+                    print(f"Error with direct API call for {ticker}: {direct_error}")
+                
+                # If all methods fail, return empty data
                 return self._create_empty_stock_data()
-            
-            latest_bar = bars.iloc[-1]
-            
-            # Get previous day's close for calculating change
-            yesterday = datetime.now() - timedelta(days=1)
-            yesterday_bars = self.api.get_bars(ticker, '1Day', 
-                                              start=yesterday.strftime('%Y-%m-%d'),
-                                              limit=1).df
-            prev_close = yesterday_bars.iloc[-1]['close'] if not yesterday_bars.empty else latest_bar['close']
-            
-            # Calculate change percentage
-            change_pct = ((latest_bar['close'] - prev_close) / prev_close) * 100
-            
-            # Get 52-week high/low
-            year_ago = datetime.now() - timedelta(days=365)
-            yearly_bars = self.api.get_bars(ticker, '1Day', 
-                                           start=year_ago.strftime('%Y-%m-%d')).df
-            
-            high_52w = yearly_bars['high'].max() if not yearly_bars.empty else None
-            low_52w = yearly_bars['low'].min() if not yearly_bars.empty else None
-            
-            # Create stock data dictionary
-            stock_data = {
-                'price': latest_bar['close'],
-                'change': change_pct,
-                'volume': latest_bar['volume'],
-                'avg_volume': yearly_bars['volume'].mean() if not yearly_bars.empty else None,
-                'market_cap': None,  # Not directly available from Alpaca
-                'beta': None,  # Not directly available from Alpaca
-                'pe_ratio': None,  # Not directly available from Alpaca
-                '52w_high': high_52w,
-                '52w_low': low_52w
-            }
-            
-            return stock_data
         
         except Exception as e:
             print(f"Error fetching stock data for {ticker} from Alpaca: {e}")
@@ -179,33 +283,51 @@ class OptionsMonitor:
             # Round to nearest minute for caching
             timestamp = datetime.now().replace(second=0, microsecond=0)
         
-        if not self.api or not hasattr(self.api, 'get_option_chain'):
+        # Check if we have API access
+        if not self.api:
+            print(f"No API access for {ticker} options data")
             return self._create_empty_options_data()
         
         try:
+            print(f"Fetching options data for {ticker}...")
+            
             # Get current stock price
             stock_data = self.fetch_stock_data(ticker)
             current_price = stock_data.get('price')
             
             if not current_price:
+                print(f"No stock price available for {ticker}, cannot fetch options data")
                 return self._create_empty_options_data()
+            
+            print(f"Current price for {ticker}: ${current_price}")
             
             # Get available expiration dates
             expirations = self._get_option_expirations(ticker)
             
             if not expirations:
+                print(f"No expiration dates available for {ticker}, cannot fetch options data")
                 return self._create_empty_options_data()
+            
+            print(f"Available expirations for {ticker}: {expirations}")
             
             # Get the first expiration date
             expiration = expirations[0]
+            print(f"Using expiration date: {expiration}")
             
             # Get options chain for this expiration
             calls, puts = self._get_option_chain(ticker, expiration)
+            
+            if not calls and not puts:
+                print(f"No options chain data available for {ticker} at {expiration}")
+                return self._create_empty_options_data()
             
             # Calculate ATM IV
             atm_call_iv = self._get_atm_iv(calls, current_price) if calls else None
             atm_put_iv = self._get_atm_iv(puts, current_price) if puts else None
             
+            print(f"ATM Call IV: {atm_call_iv}, ATM Put IV: {atm_put_iv}")
+            
+            # Create options data dictionary
             options_data = {
                 'ticker': ticker,
                 'expiration': expiration,
@@ -216,10 +338,13 @@ class OptionsMonitor:
                 'atm_put_iv': atm_put_iv
             }
             
+            print(f"Successfully fetched options data for {ticker} with {len(expirations)} expirations, {len(calls)} calls, and {len(puts)} puts")
             return options_data
         
         except Exception as e:
             print(f"Error fetching options data for {ticker} from Alpaca: {e}")
+            import traceback
+            traceback.print_exc()
             return self._create_empty_options_data()
     
     def _create_empty_options_data(self):
@@ -237,74 +362,321 @@ class OptionsMonitor:
     def _get_option_expirations(self, ticker):
         """Get available option expiration dates for a ticker using Alpaca API"""
         try:
-            # This is a placeholder - implement the actual Alpaca API call
-            # For example:
-            # expirations = self.api.get_option_expirations(ticker)
+            # Check if we have API access
+            if not self.api:
+                print(f"No API access for {ticker} expirations")
+                return self._generate_sample_expirations()
             
-            # For now, generate some sample expiration dates
-            today = datetime.now()
-            expirations = [
-                (today + timedelta(days=i*7)).strftime('%Y-%m-%d')
-                for i in range(1, 5)  # Next 4 weeks
-            ]
+            print(f"Fetching option expirations for {ticker}...")
             
-            return expirations
+            # Use Alpaca API to get option chain data
+            url = f"{self.trader.data_url}/v1beta1/options/snapshots/{ticker}"
+            headers = {
+                'APCA-API-KEY-ID': self.trader.api_key,
+                'APCA-API-SECRET-KEY': self.trader.api_secret
+            }
+            
+            # Use the requests module to make the API call
+            print(f"Making API request to {url}")
+            response = requests.get(
+                url,
+                headers=headers,
+                params={
+                    'feed': 'indicative',  # Use indicative feed if no subscription
+                    'limit': 100
+                }
+            )
+            
+            # Check if the request was successful
+            if response.status_code != 200:
+                print(f"Error fetching options data for {ticker}: {response.status_code} - {response.text}")
+                return self._generate_sample_expirations()
+            
+            # Parse the response
+            data = response.json()
+            print(f"Received options data for {ticker} with {len(data)} contracts")
+            
+            # Extract unique expiration dates from the options data
+            expirations = set()
+            for symbol, snapshot in data.items():
+                # Extract expiration date from the symbol or details
+                if 'details' in snapshot and 'expiration_date' in snapshot['details']:
+                    expirations.add(snapshot['details']['expiration_date'])
+            
+            # If we couldn't get any expirations, try an alternative approach
+            if not expirations:
+                print(f"No expirations found for {ticker} in snapshot data, trying alternative approach")
+                
+                # Try to get a list of available expirations directly
+                try:
+                    # Try using the REST API to get available expirations
+                    url = f"{self.trader.data_url}/v1beta1/options/contracts"
+                    params = {
+                        'underlying_symbol': ticker,
+                        'limit': 100
+                    }
+                    
+                    print(f"Making API request to {url} for contracts")
+                    response = requests.get(url, headers=headers, params=params)
+                    
+                    if response.status_code == 200:
+                        contracts_data = response.json()
+                        print(f"Received contracts data with {len(contracts_data)} items")
+                        
+                        # Extract unique expiration dates
+                        for contract in contracts_data:
+                            if 'expiration_date' in contract:
+                                expirations.add(contract['expiration_date'])
+                except Exception as e:
+                    print(f"Alternative approach failed: {e}")
+                
+                # If still no expirations, return sample data
+                if not expirations:
+                    print(f"No expirations found for {ticker} using alternative approach")
+                    return self._generate_sample_expirations()
+            
+            # Sort the expiration dates
+            sorted_expirations = sorted(list(expirations))
+            
+            print(f"Found {len(sorted_expirations)} expiration dates for {ticker}: {sorted_expirations}")
+            return sorted_expirations
+            
         except Exception as e:
             print(f"Error getting option expirations for {ticker}: {e}")
-            return []
+            return self._generate_sample_expirations()
+    
+    def _generate_sample_expirations(self):
+        """Generate sample expiration dates for testing"""
+        today = datetime.now()
+        expirations = [
+            (today + timedelta(days=i*7)).strftime('%Y-%m-%d')
+            for i in range(1, 5)  # Next 4 weeks
+        ]
+        print(f"Using sample expiration dates: {expirations}")
+        return expirations
     
     def _get_option_chain(self, ticker, expiration):
         """Get options chain for a ticker and expiration date using Alpaca API"""
         try:
-            # This is a placeholder - implement the actual Alpaca API call
-            # For example:
-            # chain = self.api.get_option_chain(ticker, expiration)
-            # calls = chain['calls']
-            # puts = chain['puts']
+            # Check if we have API access
+            if not self.api:
+                print(f"No API access for {ticker} options chain")
+                return self._generate_sample_options(ticker, expiration)
             
-            # For now, generate some sample options data
-            stock_data = self.fetch_stock_data(ticker)
-            current_price = stock_data.get('price', 100)  # Default to 100 if price not available
+            print(f"Fetching options chain for {ticker} at {expiration}...")
             
-            if not current_price:
-                return [], []
+            # Use Alpaca API to get option chain data
+            url = f"{self.trader.data_url}/v1beta1/options/snapshots/{ticker}"
+            headers = {
+                'APCA-API-KEY-ID': self.trader.api_key,
+                'APCA-API-SECRET-KEY': self.trader.api_secret
+            }
             
-            # Generate sample strikes around the current price
-            strikes = [round(current_price * (1 + i * 0.05), 2) for i in range(-10, 11)]
+            # Use the requests module to make the API call
+            print(f"Making API request to {url} for options chain")
+            response = requests.get(
+                url,
+                headers=headers,
+                params={
+                    'feed': 'indicative',  # Use indicative feed if no subscription
+                    'expiration_date': expiration,
+                    'limit': 1000  # Request a large number to get all strikes
+                }
+            )
             
-            # Generate sample calls
+            # Check if the request was successful
+            if response.status_code != 200:
+                print(f"Error fetching options chain for {ticker} at {expiration}: {response.status_code} - {response.text}")
+                return self._generate_sample_options(ticker, expiration)
+            
+            # Parse the response
+            data = response.json()
+            print(f"Received options chain data for {ticker} at {expiration} with {len(data)} contracts")
+            
+            # Separate calls and puts
             calls = []
-            for strike in strikes:
-                call = {
-                    'strike': strike,
-                    'lastPrice': max(0.01, round(current_price - strike + random.uniform(0.5, 2.0), 2)),
-                    'bid': max(0.01, round(current_price - strike + random.uniform(0.3, 1.5), 2)),
-                    'ask': max(0.01, round(current_price - strike + random.uniform(0.7, 2.5), 2)),
-                    'volume': int(random.uniform(100, 5000)),
-                    'openInterest': int(random.uniform(500, 10000)),
-                    'impliedVolatility': random.uniform(0.2, 0.8)
-                }
-                calls.append(call)
-            
-            # Generate sample puts
             puts = []
-            for strike in strikes:
-                put = {
-                    'strike': strike,
-                    'lastPrice': max(0.01, round(strike - current_price + random.uniform(0.5, 2.0), 2)),
-                    'bid': max(0.01, round(strike - current_price + random.uniform(0.3, 1.5), 2)),
-                    'ask': max(0.01, round(strike - current_price + random.uniform(0.7, 2.5), 2)),
-                    'volume': int(random.uniform(100, 5000)),
-                    'openInterest': int(random.uniform(500, 10000)),
-                    'impliedVolatility': random.uniform(0.2, 0.8)
-                }
-                puts.append(put)
             
+            for symbol, snapshot in data.items():
+                if 'details' not in snapshot:
+                    continue
+                
+                details = snapshot['details']
+                
+                # Skip if not matching the requested expiration date
+                if details.get('expiration_date') != expiration:
+                    continue
+                
+                greeks = snapshot.get('greeks', {})
+                quote = snapshot.get('quote', {})
+                trade = snapshot.get('trade', {})
+                
+                # Skip if missing essential data
+                if 'strike_price' not in details or 'type' not in details:
+                    continue
+                
+                # Create option contract data
+                contract = {
+                    'symbol': symbol,
+                    'strike': float(details['strike_price']),
+                    'expiration': details.get('expiration_date', expiration),
+                    'lastPrice': float(trade.get('price', 0)) if trade else 0,
+                    'bid': float(quote.get('bid_price', 0)) if quote else 0,
+                    'ask': float(quote.get('ask_price', 0)) if quote else 0,
+                    'volume': int(trade.get('volume', 0)) if trade else 0,
+                    'openInterest': int(details.get('open_interest', 0)) if details.get('open_interest') else 0,
+                    'impliedVolatility': float(greeks.get('implied_volatility', 0)) if greeks else 0,
+                    'delta': float(greeks.get('delta', 0)) if greeks else 0,
+                    'gamma': float(greeks.get('gamma', 0)) if greeks else 0,
+                    'theta': float(greeks.get('theta', 0)) if greeks else 0,
+                    'vega': float(greeks.get('vega', 0)) if greeks else 0
+                }
+                
+                # Add to appropriate list
+                if details['type'].lower() == 'call':
+                    calls.append(contract)
+                elif details['type'].lower() == 'put':
+                    puts.append(contract)
+            
+            # If we couldn't get any options data, try an alternative approach
+            if not calls and not puts:
+                print(f"No options data found for {ticker} at {expiration}, trying alternative approach")
+                
+                # Try to get options data using a different endpoint
+                try:
+                    url = f"{self.trader.data_url}/v1beta1/options/contracts"
+                    params = {
+                        'underlying_symbol': ticker,
+                        'expiration_date': expiration,
+                        'limit': 1000
+                    }
+                    
+                    print(f"Making API request to {url} for contracts")
+                    contracts_response = requests.get(url, headers=headers, params=params)
+                    
+                    if contracts_response.status_code == 200:
+                        contracts_data = contracts_response.json()
+                        print(f"Received contracts data with {len(contracts_data)} items")
+                        
+                        # Get contract symbols
+                        contract_symbols = [contract['symbol'] for contract in contracts_data]
+                        
+                        if contract_symbols:
+                            # Get snapshots for these symbols
+                            snapshots_url = f"{self.trader.data_url}/v1beta1/options/snapshots"
+                            snapshots_params = {
+                                'symbols': ','.join(contract_symbols[:100]),  # API limit
+                                'feed': 'indicative'
+                            }
+                            
+                            print(f"Making API request to {snapshots_url} for snapshots")
+                            snapshots_response = requests.get(snapshots_url, headers=headers, params=snapshots_params)
+                            
+                            if snapshots_response.status_code == 200:
+                                snapshots_data = snapshots_response.json()
+                                print(f"Received snapshots data with {len(snapshots_data)} items")
+                                
+                                # Process snapshots
+                                for symbol, snapshot in snapshots_data.items():
+                                    if 'details' not in snapshot:
+                                        continue
+                                    
+                                    details = snapshot['details']
+                                    greeks = snapshot.get('greeks', {})
+                                    quote = snapshot.get('quote', {})
+                                    trade = snapshot.get('trade', {})
+                                    
+                                    # Create option contract data
+                                    contract = {
+                                        'symbol': symbol,
+                                        'strike': float(details['strike_price']),
+                                        'expiration': details.get('expiration_date', expiration),
+                                        'lastPrice': float(trade.get('price', 0)) if trade else 0,
+                                        'bid': float(quote.get('bid_price', 0)) if quote else 0,
+                                        'ask': float(quote.get('ask_price', 0)) if quote else 0,
+                                        'volume': int(trade.get('volume', 0)) if trade else 0,
+                                        'openInterest': int(details.get('open_interest', 0)) if details.get('open_interest') else 0,
+                                        'impliedVolatility': float(greeks.get('implied_volatility', 0)) if greeks else 0,
+                                        'delta': float(greeks.get('delta', 0)) if greeks else 0,
+                                        'gamma': float(greeks.get('gamma', 0)) if greeks else 0,
+                                        'theta': float(greeks.get('theta', 0)) if greeks else 0,
+                                        'vega': float(greeks.get('vega', 0)) if greeks else 0
+                                    }
+                                    
+                                    # Add to appropriate list
+                                    if details['type'].lower() == 'call':
+                                        calls.append(contract)
+                                    elif details['type'].lower() == 'put':
+                                        puts.append(contract)
+                except Exception as alt_error:
+                    print(f"Alternative approach failed: {alt_error}")
+            
+            # If we still couldn't get any options data, use sample data
+            if not calls and not puts:
+                print(f"No options data found for {ticker} at {expiration}, using sample data")
+                return self._generate_sample_options(ticker, expiration)
+            
+            print(f"Found {len(calls)} calls and {len(puts)} puts for {ticker} at {expiration}")
             return calls, puts
-        
+            
         except Exception as e:
             print(f"Error getting option chain for {ticker} at {expiration}: {e}")
+            return self._generate_sample_options(ticker, expiration)
+    
+    def _generate_sample_options(self, ticker, expiration):
+        """Generate sample options data for testing"""
+        # Get current stock price
+        stock_data = self.fetch_stock_data(ticker)
+        current_price = stock_data.get('price', 100)  # Default to 100 if price not available
+        
+        if not current_price:
             return [], []
+        
+        # Generate sample strikes around the current price
+        strikes = [round(current_price * (1 + i * 0.05), 2) for i in range(-10, 11)]
+        
+        # Generate sample calls
+        calls = []
+        for strike in strikes:
+            call = {
+                'symbol': f"{ticker}{expiration.replace('-', '')}C{int(strike*100):08d}",
+                'strike': strike,
+                'expiration': expiration,
+                'lastPrice': max(0.01, round(current_price - strike + random.uniform(0.5, 2.0), 2)),
+                'bid': max(0.01, round(current_price - strike + random.uniform(0.3, 1.5), 2)),
+                'ask': max(0.01, round(current_price - strike + random.uniform(0.7, 2.5), 2)),
+                'volume': int(random.uniform(100, 5000)),
+                'openInterest': int(random.uniform(500, 10000)),
+                'impliedVolatility': random.uniform(0.2, 0.8),
+                'delta': random.uniform(0.1, 0.9),
+                'gamma': random.uniform(0.01, 0.2),
+                'theta': random.uniform(-0.1, -0.01),
+                'vega': random.uniform(0.1, 0.5)
+            }
+            calls.append(call)
+        
+        # Generate sample puts
+        puts = []
+        for strike in strikes:
+            put = {
+                'symbol': f"{ticker}{expiration.replace('-', '')}P{int(strike*100):08d}",
+                'strike': strike,
+                'expiration': expiration,
+                'lastPrice': max(0.01, round(strike - current_price + random.uniform(0.5, 2.0), 2)),
+                'bid': max(0.01, round(strike - current_price + random.uniform(0.3, 1.5), 2)),
+                'ask': max(0.01, round(strike - current_price + random.uniform(0.7, 2.5), 2)),
+                'volume': int(random.uniform(100, 5000)),
+                'openInterest': int(random.uniform(500, 10000)),
+                'impliedVolatility': random.uniform(0.2, 0.8),
+                'delta': random.uniform(-0.9, -0.1),
+                'gamma': random.uniform(0.01, 0.2),
+                'theta': random.uniform(-0.1, -0.01),
+                'vega': random.uniform(0.1, 0.5)
+            }
+            puts.append(put)
+        
+        print(f"Generated {len(calls)} sample calls and {len(puts)} sample puts for {ticker} at {expiration}")
+        return calls, puts
     
     def _get_atm_iv(self, options, current_price):
         """Get at-the-money implied volatility"""
@@ -671,6 +1043,30 @@ def create_dashboard(monitor):
                 /* Fix dropdown width */
                 .dash-dropdown {
                     width: 100% !important;
+                }
+                
+                /* Fix dropdown text colors */
+                .Select-control, .Select-menu-outer, .Select-value, .Select-value-label {
+                    color: #333 !important;
+                    background-color: white !important;
+                }
+                
+                .Select--single > .Select-control .Select-value, .Select-placeholder {
+                    color: #333 !important;
+                }
+                
+                .VirtualizedSelectOption {
+                    background-color: white !important;
+                    color: #333 !important;
+                }
+                
+                .VirtualizedSelectFocusedOption {
+                    background-color: #f0f0f0 !important;
+                    color: #333 !important;
+                }
+                
+                .Select-menu-outer {
+                    border: 1px solid #ccc !important;
                 }
                 
                 /* Responsive adjustments */
@@ -1256,6 +1652,7 @@ def create_dashboard(monitor):
          Input("interval-component", "n_intervals")]
     )
     def update_options_chain(ticker, expiration, display_type, _):
+        """Update the options chain display based on selected ticker and expiration"""
         if not ticker:
             return html.Div("Select a ticker to view options chain.", 
                            className="text-center p-3")
@@ -1274,6 +1671,28 @@ def create_dashboard(monitor):
             return html.Div("No expiration dates available for this ticker.", 
                            className="text-center p-3")
         
+        # Check if the selected expiration matches the current data
+        if options_data.get('expiration') != expiration:
+            # We need to fetch data for the selected expiration
+            try:
+                calls, puts = monitor._get_option_chain(ticker, expiration)
+                
+                # Update the options data with the new expiration
+                options_data['expiration'] = expiration
+                options_data['calls'] = calls
+                options_data['puts'] = puts
+                
+                # Calculate ATM IV
+                stock_price = monitor.data.get(ticker, {}).get('price')
+                if stock_price:
+                    options_data['atm_call_iv'] = monitor._get_atm_iv(calls, stock_price) if calls else None
+                    options_data['atm_put_iv'] = monitor._get_atm_iv(puts, stock_price) if puts else None
+                
+                # Update the stored options data
+                monitor.options_data[ticker] = options_data
+            except Exception as e:
+                print(f"Error fetching options data for {ticker} at {expiration}: {e}")
+        
         # Get calls and puts for the selected expiration
         calls = options_data.get('calls', [])
         puts = options_data.get('puts', [])
@@ -1281,13 +1700,13 @@ def create_dashboard(monitor):
         # If calls or puts are empty, try to fetch them again
         if not calls or not puts:
             try:
-                # Refresh options data for this ticker
-                options_data = monitor.fetch_options_data(ticker)
+                # Refresh options data for this ticker and expiration
+                calls, puts = monitor._get_option_chain(ticker, expiration)
+                options_data['calls'] = calls
+                options_data['puts'] = puts
                 monitor.options_data[ticker] = options_data
-                calls = options_data.get('calls', [])
-                puts = options_data.get('puts', [])
             except Exception as e:
-                print(f"Error refreshing options data for {ticker}: {e}")
+                print(f"Error refreshing options data for {ticker} at {expiration}: {e}")
         
         # Get current stock price
         stock_price = monitor.data.get(ticker, {}).get('price')
@@ -1363,8 +1782,8 @@ def create_dashboard(monitor):
                 html.Td(f"{call['volume']:,}" if call and 'volume' in call else "-", className="text-center"),
                 html.Td(f"{call['openInterest']:,}" if call and 'openInterest' in call else "-", className="text-center"),
                 html.Td(f"{call['impliedVolatility']:.2%}" if call and 'impliedVolatility' in call else "-", className="text-center"),
-                html.Td(f"{random.uniform(0.1, 0.9):.4f}" if call else "-", className="text-center"),
-                html.Td(f"{random.uniform(0.01, 0.09):.4f}" if call else "-", className="text-center"),
+                html.Td(f"{call['delta']:.4f}" if call and 'delta' in call else "-", className="text-center"),
+                html.Td(f"{call['gamma']:.4f}" if call and 'gamma' in call else "-", className="text-center"),
                 html.Td(f"${call['bid']:.2f}" if call and 'bid' in call else "-", className="text-center text-danger"),
                 html.Td(f"${call['ask']:.2f}" if call and 'ask' in call else "-", className="text-center text-success"),
                 
@@ -1379,8 +1798,8 @@ def create_dashboard(monitor):
                 html.Td(f"{put['volume']:,}" if put and 'volume' in put else "-", className="text-center"),
                 html.Td(f"{put['openInterest']:,}" if put and 'openInterest' in put else "-", className="text-center"),
                 html.Td(f"{put['impliedVolatility']:.2%}" if put and 'impliedVolatility' in put else "-", className="text-center"),
-                html.Td(f"-{random.uniform(0.1, 0.9):.4f}" if put else "-", className="text-center"),
-                html.Td(f"{random.uniform(0.01, 0.09):.4f}" if put else "-", className="text-center"),
+                html.Td(f"{put['delta']:.4f}" if put and 'delta' in put else "-", className="text-center"),
+                html.Td(f"{put['gamma']:.4f}" if put and 'gamma' in put else "-", className="text-center"),
             ], className=row_class)
             rows.append(row)
         
@@ -1448,21 +1867,47 @@ def create_dashboard(monitor):
          Input("interval-component", "n_intervals")]
     )
     def update_expiration_options(ticker, _):
+        """Update the expiration date options based on the selected ticker"""
         if not ticker:
             return []
         
+        # Get options data for the selected ticker
         options_data = monitor.options_data.get(ticker, {})
-        if not options_data or 'expirations' not in options_data:
-            return []
         
+        # Check if we have expiration dates
+        if not options_data or 'expirations' not in options_data or not options_data['expirations']:
+            print(f"No expiration dates found for {ticker}")
+            # Try to refresh the data
+            try:
+                monitor.options_data[ticker] = monitor.fetch_options_data(ticker)
+                options_data = monitor.options_data.get(ticker, {})
+            except Exception as e:
+                print(f"Error refreshing options data for {ticker}: {e}")
+        
+        # Get the expiration dates
         expirations = options_data.get('expirations', [])
-        return [{"label": exp, "value": exp} for exp in expirations]
+        
+        # Format the expiration dates for display
+        formatted_expirations = []
+        for exp in expirations:
+            try:
+                # Try to parse and format the date for better display
+                exp_date = datetime.strptime(exp, '%Y-%m-%d')
+                label = exp_date.strftime('%b %d, %Y')  # e.g., "Jan 15, 2023"
+                formatted_expirations.append({"label": label, "value": exp})
+            except:
+                # If parsing fails, use the original string
+                formatted_expirations.append({"label": exp, "value": exp})
+        
+        print(f"Found {len(formatted_expirations)} expiration dates for {ticker}")
+        return formatted_expirations
 
     @app.callback(
         Output("expiration-selector", "value"),
         [Input("expiration-selector", "options")]
     )
     def set_default_expiration(available_options):
+        """Set the default expiration date to the first available option"""
         if available_options and len(available_options) > 0:
             return available_options[0]["value"]
         return None
