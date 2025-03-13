@@ -1,0 +1,83 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+virtualenv/
+.venv/
+.env/
+.ENV/
+virtual/
+
+# Cache directories
+.cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Environment files
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# API keys and secrets
+*.pem
+*.key
+*.cert
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Project specific cache
+.eggs/
+.Python-Eggs/
+scipy-data/
+matplotlib/
+~/Library/Caches/
+~/.cache/
+pip-wheel-metadata/
+data_cache/
+
+# Alpaca API credentials
+alpaca_credentials.json
+
+# Data files
+*.csv
+*.xlsx
+*.pkl
+*.pickle
