@@ -169,238 +169,461 @@ class OptionTrader:
         return round(price, 2)
     
     def buy_option(self, ticker, expiration, strike, option_type, quantity, price=None):
-        """Buy an option contract"""
-        try:
-            # Format the option symbol
-            date_part = expiration.replace('-', '')
-            option_symbol = f"{ticker}{date_part}{'C' if option_type.lower() == 'call' else 'P'}{int(strike*100):08d}"
+        """
+        Buy an option contract.
+        
+        Args:
+            ticker (str): Stock ticker symbol
+            expiration (str): Option expiration date in YYYY-MM-DD format
+            strike (float): Option strike price
+            option_type (str): Option type ('call' or 'put')
+            quantity (int): Number of contracts to buy
+            price (float, optional): Limit price (if None, market order is used)
             
-            # Check if we're in simulation mode
-            if self.simulation_mode:
-                # Generate a simulated order ID
-                order_id = f"sim-order-{int(time.time())}"
-                
-                # Calculate the cost
-                if price is None:
-                    # If no price specified, use a simulated market price
-                    price = self._get_simulated_price(ticker, strike, option_type)
-                
-                cost = price * quantity * 100  # Each option contract is for 100 shares
-                
-                # Check if we have enough buying power
-                if cost > self.simulated_portfolio['buying_power']:
-                    return {'error': 'Insufficient buying power'}
-                
-                # Update the portfolio
-                self.simulated_portfolio['buying_power'] -= cost
-                
-                # Add the position
-                position = {
+        Returns:
+            dict: Order information
+        """
+        # Format the option symbol
+        option_symbol = self.format_option_symbol(ticker, expiration, strike, option_type)
+        
+        # Check if we're in simulation mode
+        if self.simulation_mode:
+            # Simulate buying an option
+            if not self.simulated_portfolio:
+                self._initialize_simulation()
+            
+            # Check if we have enough buying power
+            if price:
+                cost = price * 100 * quantity
+            else:
+                # Estimate price for market order
+                cost = self._get_simulated_price(ticker, strike, option_type) * 100 * quantity
+            
+            if cost > self.simulated_portfolio['buying_power']:
+                return {
+                    'status': 'rejected',
+                    'reason': 'Insufficient buying power',
                     'symbol': option_symbol,
-                    'quantity': quantity,
-                    'avg_price': price,
-                    'current_price': price,
-                    'cost_basis': cost,
-                    'market_value': cost,
+                    'side': 'buy',
+                    'qty': quantity,
+                    'type': 'market' if price is None else 'limit',
+                    'limit_price': price,
+                    'filled_avg_price': None,
+                    'id': f"sim_{int(time.time())}",
+                    'created_at': dt.datetime.now().isoformat(),
+                    'error': True,
+                    'error_message': 'Insufficient buying power'
+                }
+            
+            # Simulate the order
+            filled_price = self._get_simulated_price(ticker, strike, option_type)
+            cost = filled_price * 100 * quantity
+            
+            # Update portfolio
+            self.simulated_portfolio['cash'] -= cost
+            self.simulated_portfolio['buying_power'] -= cost
+            self.simulated_portfolio['equity'] -= cost  # Will be adjusted when position is added
+            
+            # Add to positions
+            position_found = False
+            for position in self.simulated_portfolio['positions']:
+                if position['symbol'] == option_symbol:
+                    # Update existing position
+                    avg_price = (position['avg_entry_price'] * position['qty'] + filled_price * quantity) / (position['qty'] + quantity)
+                    position['avg_entry_price'] = avg_price
+                    position['qty'] += quantity
+                    position['market_value'] = position['qty'] * filled_price * 100
+                    position_found = True
+                    break
+            
+            if not position_found:
+                # Add new position
+                self.simulated_portfolio['positions'].append({
+                    'symbol': option_symbol,
+                    'qty': quantity,
+                    'avg_entry_price': filled_price,
+                    'current_price': filled_price,
+                    'market_value': filled_price * 100 * quantity,
                     'unrealized_pl': 0,
                     'unrealized_plpc': 0,
-                    'type': option_type,
-                    'expiration': expiration,
+                    'type': 'option',
+                    'option_type': option_type,
                     'strike': strike,
+                    'expiration': expiration,
                     'underlying': ticker
-                }
-                
-                self.simulated_portfolio['positions'].append(position)
-                
-                # Create a simulated order
-                order = {
-                    'id': order_id,
-                    'symbol': option_symbol,
-                    'status': 'filled',
-                    'side': 'buy',
-                    'qty': quantity,
-                    'filled_qty': quantity,
-                    'filled_avg_price': price,
-                    'created_at': dt.datetime.now().isoformat(),
-                    'type': 'market' if price is None else 'limit'
-                }
-                
-                # Add to transaction history
-                transaction = {
-                    'id': f"sim-tx-{int(time.time())}",
-                    'order_id': order_id,
-                    'symbol': option_symbol,
-                    'side': 'buy',
-                    'qty': quantity,
-                    'price': price,
-                    'timestamp': dt.datetime.now().isoformat(),
-                    'commission': 0,
-                    'asset_class': 'option'
-                }
-                
-                self.simulated_portfolio['transactions'].append(transaction)
-                
-                # Save the updated portfolio
-                self._save_portfolio()
-                
-                return order
+                })
             
-            # If not in simulation mode, place a real order with Alpaca
-            try:
-                # Implement real trading with Alpaca API
-                order_type = 'limit' if price else 'market'
-                limit_price = price * 100 if price else None  # Convert to per-share price
-                
-                order = self.api.submit_order(
-                    symbol=option_symbol,
-                    qty=quantity,
-                    side='buy',
-                    type=order_type,
-                    time_in_force='day',
-                    limit_price=limit_price
-                )
-                
-                # Check if order is a dictionary or an object
-                if isinstance(order, dict):
-                    # If it's already a dictionary, return it
-                    return order
-                else:
-                    # If it's an object, convert it to a dictionary
-                    return {
-                        'id': order.id,
-                        'symbol': order.symbol,
-                        'status': order.status,
-                        'side': 'buy',
-                        'qty': quantity,
-                        'filled_qty': order.filled_qty,
-                        'filled_avg_price': order.filled_avg_price,
-                        'created_at': order.created_at
-                    }
-            except Exception as e:
-                print(f"API Error: {e}")
-                return {'error': str(e)}
-        except Exception as e:
-            print(f"Error buying option: {e}")
-            return {'error': str(e)}
-    
-    def sell_option(self, ticker, expiration, strike, option_type, quantity, price=None):
-        """Sell an option contract"""
+            # Add to transactions
+            transaction = {
+                'id': f"sim_{int(time.time())}",
+                'symbol': option_symbol,
+                'side': 'buy',
+                'qty': quantity,
+                'price': filled_price,
+                'cost': cost,
+                'type': 'option',
+                'option_type': option_type,
+                'strike': strike,
+                'expiration': expiration,
+                'underlying': ticker,
+                'timestamp': dt.datetime.now().isoformat()
+            }
+            self.simulated_portfolio['transactions'].append(transaction)
+            
+            # Save portfolio
+            self._save_portfolio()
+            
+            # Return order information
+            return {
+                'status': 'filled',
+                'symbol': option_symbol,
+                'side': 'buy',
+                'qty': quantity,
+                'type': 'market' if price is None else 'limit',
+                'limit_price': price,
+                'filled_avg_price': filled_price,
+                'id': transaction['id'],
+                'created_at': transaction['timestamp'],
+                'success': True
+            }
+        
+        # Real trading with Alpaca API
+        if not self.api:
+            return {
+                'status': 'rejected',
+                'reason': 'No API connection',
+                'symbol': option_symbol,
+                'side': 'buy',
+                'qty': quantity,
+                'type': 'market' if price is None else 'limit',
+                'limit_price': price,
+                'filled_avg_price': None,
+                'id': None,
+                'created_at': dt.datetime.now().isoformat(),
+                'error': True,
+                'error_message': 'No API connection'
+            }
+        
         try:
-            # Format the option symbol
-            date_part = expiration.replace('-', '')
-            option_symbol = f"{ticker}{date_part}{'C' if option_type.lower() == 'call' else 'P'}{int(strike*100):08d}"
+            # Check account buying power
+            account = self.api.get_account()
+            buying_power = float(account.buying_power)
             
-            # Check if we're in simulation mode
-            if self.simulation_mode:
-                # Generate a simulated order ID
-                order_id = f"sim-order-{int(time.time())}"
-                
-                # Calculate the proceeds
-                if price is None:
-                    # If no price specified, use a simulated market price
-                    price = self._get_simulated_price(ticker, strike, option_type)
-                
-                proceeds = price * quantity * 100  # Each option contract is for 100 shares
-                
-                # Find the position
-                position_found = False
-                for i, position in enumerate(self.simulated_portfolio['positions']):
-                    if position['symbol'] == option_symbol and position['quantity'] >= quantity:
-                        position_found = True
-                        
-                        # Calculate realized P/L
-                        realized_pl = (price - position['avg_price']) * quantity * 100
-                        
-                        # Update the position
-                        if position['quantity'] == quantity:
-                            # Remove the position if selling all
-                            self.simulated_portfolio['positions'].pop(i)
-                        else:
-                            # Reduce the position if selling part
-                            position['quantity'] -= quantity
-                            position['cost_basis'] = position['avg_price'] * position['quantity'] * 100
-                            position['market_value'] = position['current_price'] * position['quantity'] * 100
-                        
-                        # Update the portfolio
-                        self.simulated_portfolio['buying_power'] += proceeds
-                        self.simulated_portfolio['equity'] += realized_pl
-                        
-                        break
-                
-                if not position_found:
-                    return {'error': 'Position not found or insufficient quantity'}
-                
-                # Create a simulated order
-                order = {
-                    'id': order_id,
+            # Estimate cost (very rough estimate)
+            estimated_cost = strike * 0.1 * 100 * quantity  # Assume premium is ~10% of strike
+            
+            if estimated_cost > buying_power:
+                return {
+                    'status': 'rejected',
+                    'reason': 'Insufficient buying power',
                     'symbol': option_symbol,
-                    'status': 'filled',
-                    'side': 'sell',
+                    'side': 'buy',
                     'qty': quantity,
-                    'filled_qty': quantity,
-                    'filled_avg_price': price,
+                    'type': 'market' if price is None else 'limit',
+                    'limit_price': price,
+                    'filled_avg_price': None,
+                    'id': None,
                     'created_at': dt.datetime.now().isoformat(),
-                    'type': 'market' if price is None else 'limit'
+                    'error': True,
+                    'error_message': 'Insufficient buying power'
                 }
-                
-                # Add to transaction history
-                transaction = {
-                    'id': f"sim-tx-{int(time.time())}",
-                    'order_id': order_id,
+            
+            # Submit the order
+            order_type = 'market' if price is None else 'limit'
+            order_args = {
+                'symbol': option_symbol,
+                'qty': quantity,
+                'side': 'buy',
+                'type': order_type,
+                'time_in_force': 'day'
+            }
+            
+            if price is not None:
+                order_args['limit_price'] = price
+            
+            order = self.api.submit_order(**order_args)
+            
+            # Return order information
+            return {
+                'status': order.status,
+                'symbol': order.symbol,
+                'side': order.side,
+                'qty': order.qty,
+                'type': order.type,
+                'limit_price': getattr(order, 'limit_price', None),
+                'filled_avg_price': getattr(order, 'filled_avg_price', None),
+                'id': order.id,
+                'created_at': order.created_at,
+                'success': True
+            }
+        except APIError as e:
+            # Handle API errors
+            return {
+                'status': 'rejected',
+                'reason': str(e),
+                'symbol': option_symbol,
+                'side': 'buy',
+                'qty': quantity,
+                'type': 'market' if price is None else 'limit',
+                'limit_price': price,
+                'filled_avg_price': None,
+                'id': None,
+                'created_at': dt.datetime.now().isoformat(),
+                'error': True,
+                'error_message': str(e)
+            }
+        except Exception as e:
+            # Handle other errors
+            return {
+                'status': 'rejected',
+                'reason': str(e),
+                'symbol': option_symbol,
+                'side': 'buy',
+                'qty': quantity,
+                'type': 'market' if price is None else 'limit',
+                'limit_price': price,
+                'filled_avg_price': None,
+                'id': None,
+                'created_at': dt.datetime.now().isoformat(),
+                'error': True,
+                'error_message': str(e)
+            }
+    
+    def sell_option(self, ticker, expiration_date, strike_price, option_type, quantity, price=None):
+        """
+        Sell an option contract.
+        
+        Args:
+            ticker (str): Stock ticker symbol
+            expiration_date (str): Option expiration date in YYYY-MM-DD format
+            strike_price (float): Option strike price
+            option_type (str): Option type ('call' or 'put')
+            quantity (int): Number of contracts to sell
+            price (float, optional): Limit price (if None, market order is used)
+            
+        Returns:
+            dict: Order information
+        """
+        # Format the option symbol
+        option_symbol = self.format_option_symbol(ticker, expiration_date, strike_price, option_type)
+        
+        # Check if we're in simulation mode
+        if self.simulation_mode:
+            # Simulate selling an option
+            if not self.simulated_portfolio:
+                self._initialize_simulation()
+            
+            # Check if we have the position to sell
+            position_found = False
+            position_index = -1
+            for i, position in enumerate(self.simulated_portfolio['positions']):
+                if position['symbol'] == option_symbol:
+                    position_found = True
+                    position_index = i
+                    if position['qty'] < quantity:
+                        return {
+                            'status': 'rejected',
+                            'reason': 'Insufficient position quantity',
+                            'symbol': option_symbol,
+                            'side': 'sell',
+                            'qty': quantity,
+                            'type': 'market' if price is None else 'limit',
+                            'limit_price': price,
+                            'filled_avg_price': None,
+                            'id': f"sim_{int(time.time())}",
+                            'created_at': dt.datetime.now().isoformat(),
+                            'error': True,
+                            'error_message': 'Insufficient position quantity'
+                        }
+                    break
+            
+            if not position_found:
+                return {
+                    'status': 'rejected',
+                    'reason': 'Position not found',
                     'symbol': option_symbol,
                     'side': 'sell',
                     'qty': quantity,
-                    'price': price,
-                    'timestamp': dt.datetime.now().isoformat(),
-                    'commission': 0,
-                    'asset_class': 'option',
-                    'realized_pl': realized_pl
+                    'type': 'market' if price is None else 'limit',
+                    'limit_price': price,
+                    'filled_avg_price': None,
+                    'id': f"sim_{int(time.time())}",
+                    'created_at': dt.datetime.now().isoformat(),
+                    'error': True,
+                    'error_message': 'Position not found'
                 }
-                
-                self.simulated_portfolio['transactions'].append(transaction)
-                
-                # Save the updated portfolio
-                self._save_portfolio()
-                
-                return order
             
-            # If not in simulation mode, place a real order with Alpaca
+            # Simulate the order
+            filled_price = self._get_simulated_price(ticker, strike_price, option_type)
+            proceeds = filled_price * 100 * quantity
+            
+            # Update portfolio
+            self.simulated_portfolio['cash'] += proceeds
+            self.simulated_portfolio['buying_power'] += proceeds
+            
+            # Update position
+            position = self.simulated_portfolio['positions'][position_index]
+            if position['qty'] == quantity:
+                # Remove position if selling all
+                realized_pl = (filled_price - position['avg_entry_price']) * 100 * quantity
+                del self.simulated_portfolio['positions'][position_index]
+            else:
+                # Update position if selling partial
+                realized_pl = (filled_price - position['avg_entry_price']) * 100 * quantity
+                position['qty'] -= quantity
+                position['market_value'] = position['qty'] * filled_price * 100
+            
+            # Update equity with realized P&L
+            self.simulated_portfolio['equity'] += realized_pl
+            
+            # Add to transactions
+            transaction = {
+                'id': f"sim_{int(time.time())}",
+                'symbol': option_symbol,
+                'side': 'sell',
+                'qty': quantity,
+                'price': filled_price,
+                'proceeds': proceeds,
+                'realized_pl': realized_pl,
+                'type': 'option',
+                'option_type': option_type,
+                'strike': strike_price,
+                'expiration': expiration_date,
+                'underlying': ticker,
+                'timestamp': dt.datetime.now().isoformat()
+            }
+            self.simulated_portfolio['transactions'].append(transaction)
+            
+            # Save portfolio
+            self._save_portfolio()
+            
+            # Return order information
+            return {
+                'status': 'filled',
+                'symbol': option_symbol,
+                'side': 'sell',
+                'qty': quantity,
+                'type': 'market' if price is None else 'limit',
+                'limit_price': price,
+                'filled_avg_price': filled_price,
+                'id': transaction['id'],
+                'created_at': transaction['timestamp'],
+                'success': True
+            }
+        
+        # Real trading with Alpaca API
+        if not self.api:
+            return {
+                'status': 'rejected',
+                'reason': 'No API connection',
+                'symbol': option_symbol,
+                'side': 'sell',
+                'qty': quantity,
+                'type': 'market' if price is None else 'limit',
+                'limit_price': price,
+                'filled_avg_price': None,
+                'id': None,
+                'created_at': dt.datetime.now().isoformat(),
+                'error': True,
+                'error_message': 'No API connection'
+            }
+        
+        try:
+            # Check if we have the position
             try:
-                # Implement real trading with Alpaca API
-                order_type = 'limit' if price else 'market'
-                limit_price = price * 100 if price else None  # Convert to per-share price
-                
-                order = self.api.submit_order(
-                    symbol=option_symbol,
-                    qty=quantity,
-                    side='sell',
-                    type=order_type,
-                    time_in_force='day',
-                    limit_price=limit_price
-                )
-                
-                # Check if order is a dictionary or an object
-                if isinstance(order, dict):
-                    # If it's already a dictionary, return it
-                    return order
-                else:
-                    # If it's an object, convert it to a dictionary
+                position = self.api.get_position(option_symbol)
+                if int(position.qty) < quantity:
                     return {
-                        'id': order.id,
-                        'symbol': order.symbol,
-                        'status': order.status,
+                        'status': 'rejected',
+                        'reason': 'Insufficient position quantity',
+                        'symbol': option_symbol,
                         'side': 'sell',
                         'qty': quantity,
-                        'filled_qty': order.filled_qty,
-                        'filled_avg_price': order.filled_avg_price,
-                        'created_at': order.created_at
+                        'type': 'market' if price is None else 'limit',
+                        'limit_price': price,
+                        'filled_avg_price': None,
+                        'id': None,
+                        'created_at': dt.datetime.now().isoformat(),
+                        'error': True,
+                        'error_message': 'Insufficient position quantity'
                     }
             except Exception as e:
-                print(f"API Error: {e}")
-                return {'error': str(e), 'status': 'error'}  # Add status field for error cases
+                # Position not found
+                return {
+                    'status': 'rejected',
+                    'reason': 'Position not found',
+                    'symbol': option_symbol,
+                    'side': 'sell',
+                    'qty': quantity,
+                    'type': 'market' if price is None else 'limit',
+                    'limit_price': price,
+                    'filled_avg_price': None,
+                    'id': None,
+                    'created_at': dt.datetime.now().isoformat(),
+                    'error': True,
+                    'error_message': 'Position not found'
+                }
+            
+            # Submit the order
+            order_type = 'market' if price is None else 'limit'
+            order_args = {
+                'symbol': option_symbol,
+                'qty': quantity,
+                'side': 'sell',
+                'type': order_type,
+                'time_in_force': 'day'
+            }
+            
+            if price is not None:
+                order_args['limit_price'] = price
+            
+            order = self.api.submit_order(**order_args)
+            
+            # Return order information
+            return {
+                'status': order.status,
+                'symbol': order.symbol,
+                'side': order.side,
+                'qty': order.qty,
+                'type': order.type,
+                'limit_price': getattr(order, 'limit_price', None),
+                'filled_avg_price': getattr(order, 'filled_avg_price', None),
+                'id': order.id,
+                'created_at': order.created_at,
+                'success': True
+            }
+        except APIError as e:
+            # Handle API errors
+            return {
+                'status': 'rejected',
+                'reason': str(e),
+                'symbol': option_symbol,
+                'side': 'sell',
+                'qty': quantity,
+                'type': 'market' if price is None else 'limit',
+                'limit_price': price,
+                'filled_avg_price': None,
+                'id': None,
+                'created_at': dt.datetime.now().isoformat(),
+                'error': True,
+                'error_message': str(e)
+            }
         except Exception as e:
-            print(f"Error selling option: {e}")
-            return {'error': str(e), 'status': 'error'}  # Add status field for error cases
+            # Handle other errors
+            return {
+                'status': 'rejected',
+                'reason': str(e),
+                'symbol': option_symbol,
+                'side': 'sell',
+                'qty': quantity,
+                'type': 'market' if price is None else 'limit',
+                'limit_price': price,
+                'filled_avg_price': None,
+                'id': None,
+                'created_at': dt.datetime.now().isoformat(),
+                'error': True,
+                'error_message': str(e)
+            }
     
     def get_order_history(self) -> List[Dict]:
         """Get order history"""

@@ -1098,19 +1098,6 @@ def create_dashboard(monitor):
                                 ),
                             ]),
                         ]),
-                        dbc.Row([
-                            dbc.Col([
-                                dbc.Label("Theme", style={"color": "black"}),
-                                dbc.Select(
-                                    id="theme-selector",
-                                    options=[
-                                        {"label": "Dark", "value": "dark"},
-                                        {"label": "Light", "value": "light"},
-                                    ],
-                                    value="dark",
-                                ),
-                            ]),
-                        ], className="mt-3"),
                     ], width=12, md=6),
                     
                     dbc.Col([
@@ -1201,14 +1188,49 @@ def create_dashboard(monitor):
         if not n_clicks or not ticker_input:
             return current_options, ""
         
-        # Validate ticker (basic check)
+        # Validate ticker input
         ticker_input = ticker_input.strip().upper()
-        if not ticker_input or len(ticker_input) > 5:
+        if not ticker_input:
             return current_options, ""
         
         # Check if ticker already exists
         if ticker_input in [opt["value"] for opt in current_options]:
             return current_options, ""
+        
+        # Try to validate the ticker using Alpaca API
+        valid_ticker = False
+        try:
+            if monitor.api:
+                # Try to get asset information from Alpaca
+                asset = monitor.api.get_asset(ticker_input)
+                if asset and asset.tradable:
+                    valid_ticker = True
+                    ticker_input = asset.symbol  # Use the official symbol
+            else:
+                # If no API connection, just accept the ticker (will be validated on data fetch)
+                valid_ticker = True
+        except Exception as e:
+            print(f"Error validating ticker {ticker_input}: {e}")
+            # If the exact ticker isn't found, try to search for similar tickers or company names
+            try:
+                if monitor.api:
+                    # Get a list of assets and filter for similar names
+                    assets = monitor.api.list_assets(status='active')
+                    # Filter for stocks that contain the input in their symbol or name
+                    matches = [a for a in assets if 
+                              ticker_input in a.symbol or 
+                              (hasattr(a, 'name') and a.name and ticker_input.lower() in a.name.lower())]
+                    
+                    if matches:
+                        # Use the first match
+                        ticker_input = matches[0].symbol
+                        valid_ticker = True
+            except Exception as search_error:
+                print(f"Error searching for similar tickers: {search_error}")
+        
+        if not valid_ticker:
+            # If we couldn't validate, still try to add it but print a warning
+            print(f"Warning: Could not validate ticker {ticker_input}, but adding it anyway")
         
         # Add ticker to monitor
         if ticker_input not in monitor.tickers:
@@ -1234,8 +1256,8 @@ def create_dashboard(monitor):
          Input("interval-component", "n_intervals")]
     )
     def update_options_chain(ticker, expiration, display_type, _):
-        if not ticker or not expiration:
-            return html.Div("Select a ticker and expiration date to view options chain.", 
+        if not ticker:
+            return html.Div("Select a ticker to view options chain.", 
                            className="text-center p-3")
         
         # Get options data
@@ -1244,9 +1266,28 @@ def create_dashboard(monitor):
             return html.Div("No options data available for this ticker.", 
                            className="text-center p-3")
         
+        # If no expiration is selected but we have expirations available, use the first one
+        if not expiration and 'expirations' in options_data and options_data['expirations']:
+            expiration = options_data['expirations'][0]
+            
+        if not expiration:
+            return html.Div("No expiration dates available for this ticker.", 
+                           className="text-center p-3")
+        
         # Get calls and puts for the selected expiration
         calls = options_data.get('calls', [])
         puts = options_data.get('puts', [])
+        
+        # If calls or puts are empty, try to fetch them again
+        if not calls or not puts:
+            try:
+                # Refresh options data for this ticker
+                options_data = monitor.fetch_options_data(ticker)
+                monitor.options_data[ticker] = options_data
+                calls = options_data.get('calls', [])
+                puts = options_data.get('puts', [])
+            except Exception as e:
+                print(f"Error refreshing options data for {ticker}: {e}")
         
         # Get current stock price
         stock_price = monitor.data.get(ticker, {}).get('price')
@@ -1268,6 +1309,10 @@ def create_dashboard(monitor):
         
         # Create a dictionary to match calls and puts by strike
         all_strikes = sorted(set([c['strike'] for c in calls] + [p['strike'] for p in puts]))
+        
+        if not all_strikes:
+            return html.Div("No options data available for the selected expiration date.", 
+                           className="text-center p-3")
         
         # Create the table header with the exact columns from the image
         table_header = [
@@ -1313,27 +1358,27 @@ def create_dashboard(monitor):
             # Create row with all the columns from the image
             row = html.Tr([
                 # Calls section
-                html.Td(f"${call['lastPrice']:.2f}" if call else "-", className="text-center"),
-                html.Td(f"-${random.uniform(1.0, 5.0):.2f}" if call else "-", className="text-center text-danger"),
-                html.Td(f"{call['volume']:,}" if call else "-", className="text-center"),
-                html.Td(f"{call['openInterest']:,}" if call else "-", className="text-center"),
-                html.Td(f"{call['impliedVolatility']:.2%}" if call else "-", className="text-center"),
+                html.Td(f"${call['lastPrice']:.2f}" if call and 'lastPrice' in call else "-", className="text-center"),
+                html.Td(f"-${random.uniform(0.1, 1.0):.2f}" if call else "-", className="text-center text-danger"),
+                html.Td(f"{call['volume']:,}" if call and 'volume' in call else "-", className="text-center"),
+                html.Td(f"{call['openInterest']:,}" if call and 'openInterest' in call else "-", className="text-center"),
+                html.Td(f"{call['impliedVolatility']:.2%}" if call and 'impliedVolatility' in call else "-", className="text-center"),
                 html.Td(f"{random.uniform(0.1, 0.9):.4f}" if call else "-", className="text-center"),
                 html.Td(f"{random.uniform(0.01, 0.09):.4f}" if call else "-", className="text-center"),
-                html.Td(f"${call['bid']:.2f}" if call else "-", className="text-center text-danger"),
-                html.Td(f"${call['ask']:.2f}" if call else "-", className="text-center text-success"),
+                html.Td(f"${call['bid']:.2f}" if call and 'bid' in call else "-", className="text-center text-danger"),
+                html.Td(f"${call['ask']:.2f}" if call and 'ask' in call else "-", className="text-center text-success"),
                 
                 # Strike price (center)
                 html.Td(f"${strike:.2f}", className="text-center font-weight-bold bg-dark text-white"),
                 
                 # Puts section
-                html.Td(f"${put['bid']:.2f}" if put else "-", className="text-center text-danger"),
-                html.Td(f"${put['ask']:.2f}" if put else "-", className="text-center text-success"),
-                html.Td(f"${put['lastPrice']:.2f}" if put else "-", className="text-center"),
-                html.Td(f"+${random.uniform(0.1, 3.0):.2f}" if put else "-", className="text-center text-success"),
-                html.Td(f"{put['volume']:,}" if put else "-", className="text-center"),
-                html.Td(f"{put['openInterest']:,}" if put else "-", className="text-center"),
-                html.Td(f"{put['impliedVolatility']:.2%}" if put else "-", className="text-center"),
+                html.Td(f"${put['bid']:.2f}" if put and 'bid' in put else "-", className="text-center text-danger"),
+                html.Td(f"${put['ask']:.2f}" if put and 'ask' in put else "-", className="text-center text-success"),
+                html.Td(f"${put['lastPrice']:.2f}" if put and 'lastPrice' in put else "-", className="text-center"),
+                html.Td(f"+${random.uniform(0.1, 1.0):.2f}" if put else "-", className="text-center text-success"),
+                html.Td(f"{put['volume']:,}" if put and 'volume' in put else "-", className="text-center"),
+                html.Td(f"{put['openInterest']:,}" if put and 'openInterest' in put else "-", className="text-center"),
+                html.Td(f"{put['impliedVolatility']:.2%}" if put and 'impliedVolatility' in put else "-", className="text-center"),
                 html.Td(f"-{random.uniform(0.1, 0.9):.4f}" if put else "-", className="text-center"),
                 html.Td(f"{random.uniform(0.01, 0.09):.4f}" if put else "-", className="text-center"),
             ], className=row_class)
@@ -1343,38 +1388,25 @@ def create_dashboard(monitor):
         
         # Create the options chain container with header tabs
         return html.Div([
-            # Header tabs for Calls and Puts
+            # Options chain header with tabs for different views
             dbc.Card([
                 dbc.CardHeader([
                     dbc.Tabs([
-                        dbc.Tab(label="Calls", tab_id="calls-tab", label_style={"color": "white"}),
-                        dbc.Tab(label="Puts", tab_id="puts-tab", label_style={"color": "white"}),
-                    ], id="option-type-tabs", active_tab="calls-tab"),
-                ], className="bg-dark"),
+                        dbc.Tab(label="Calls & Puts", tab_id="both", active_tab="both"),
+                        dbc.Tab(label="Calls Only", tab_id="calls"),
+                        dbc.Tab(label="Puts Only", tab_id="puts"),
+                    ], id="options-view-tabs")
+                ]),
                 dbc.CardBody([
-                    # Date and expiration selector
-                    dbc.Row([
-                        dbc.Col([
-                            dbc.ButtonGroup([
-                                dbc.Button("2D", color="secondary", outline=True, size="sm", className="active"),
-                                dbc.Button("Fri", color="secondary", outline=True, size="sm"),
-                                dbc.Button("Mar 14", color="secondary", outline=True, size="sm"),
-                            ], className="mb-3"),
-                        ], width=12),
-                    ]),
-                    
-                    # Options chain table with responsive wrapper
-                    html.Div([
-                        dbc.Table(
-                            table_header + table_body, 
-                            bordered=True, 
-                            hover=True, 
-                            responsive=True,
-                            size="sm",
-                            className="options-chain-table",
-                            style={"fontSize": "0.85rem"}
-                        )
-                    ], style={"overflowX": "auto"})
+                    # Options chain table
+                    dbc.Table(
+                        table_header + table_body,
+                        bordered=True,
+                        hover=True,
+                        responsive=True,
+                        striped=True,
+                        className="options-chain-table"
+                    )
                 ])
             ])
         ])
@@ -1447,6 +1479,473 @@ def create_dashboard(monitor):
         else:
             return "outline-success", "danger"
 
+    # Add callbacks for portfolio page components
+    @app.callback(
+        Output("account-info", "children"),
+        [Input("interval-component", "n_intervals"),
+         Input("current-page", "data")]
+    )
+    def update_account_info(_, current_page):
+        """Update the account information display"""
+        if current_page != "portfolio":
+            return html.Div()
+        
+        # Check if we have a trader instance
+        if not monitor.trader:
+            return html.Div("No trading account connected. Please check your API credentials.", 
+                           className="alert alert-warning")
+        
+        try:
+            # Get account information
+            account_info = monitor.trader.get_account_info()
+            
+            # Create account info cards
+            cards = []
+            
+            # Account Value Card
+            cards.append(
+                dbc.Card(
+                    dbc.CardBody([
+                        html.H5("Account Value", className="card-title text-primary"),
+                        html.H3(f"${float(account_info.get('equity', 0)):.2f}", className="text-success"),
+                        html.P(f"Cash: ${float(account_info.get('cash', 0)):.2f}", className="mb-0"),
+                    ]),
+                    className="mb-3 shadow-sm"
+                )
+            )
+            
+            # Buying Power Card
+            cards.append(
+                dbc.Card(
+                    dbc.CardBody([
+                        html.H5("Buying Power", className="card-title text-primary"),
+                        html.H3(f"${float(account_info.get('buying_power', 0)):.2f}", className="text-info"),
+                        html.P(f"Day Trading: ${float(account_info.get('daytrading_buying_power', 0)):.2f}", className="mb-0"),
+                    ]),
+                    className="mb-3 shadow-sm"
+                )
+            )
+            
+            # P&L Card
+            daily_pl = account_info.get('equity', 0) - account_info.get('last_equity', 0)
+            daily_pl_pct = (daily_pl / account_info.get('last_equity', 1)) * 100 if account_info.get('last_equity', 0) else 0
+            
+            pl_color = "text-success" if daily_pl >= 0 else "text-danger"
+            pl_sign = "+" if daily_pl >= 0 else ""
+            
+            cards.append(
+                dbc.Card(
+                    dbc.CardBody([
+                        html.H5("Daily P&L", className="card-title text-primary"),
+                        html.H3([
+                            f"{pl_sign}${abs(daily_pl):.2f} ",
+                            html.Small(f"({pl_sign}{abs(daily_pl_pct):.2f}%)", className="text-muted")
+                        ], className=pl_color),
+                        html.P("Since previous trading day", className="mb-0 text-muted"),
+                    ]),
+                    className="mb-3 shadow-sm"
+                )
+            )
+            
+            # Account Status Card
+            status_color = "text-success" if account_info.get('status') == 'ACTIVE' else "text-warning"
+            cards.append(
+                dbc.Card(
+                    dbc.CardBody([
+                        html.H5("Account Status", className="card-title text-primary"),
+                        html.H3(account_info.get('status', 'UNKNOWN'), className=status_color),
+                        html.P(f"Pattern Day Trader: {'Yes' if account_info.get('pattern_day_trader', False) else 'No'}", 
+                              className="mb-0"),
+                    ]),
+                    className="mb-3 shadow-sm"
+                )
+            )
+            
+            # Arrange cards in a grid
+            return dbc.Row([
+                dbc.Col(cards[0], width=12, md=6, lg=3),
+                dbc.Col(cards[1], width=12, md=6, lg=3),
+                dbc.Col(cards[2], width=12, md=6, lg=3),
+                dbc.Col(cards[3], width=12, md=6, lg=3),
+            ])
+            
+        except Exception as e:
+            print(f"Error fetching account info: {e}")
+            return html.Div(f"Error fetching account information: {str(e)}", 
+                           className="alert alert-danger")
+    
+    @app.callback(
+        Output("positions-table", "children"),
+        [Input("interval-component", "n_intervals"),
+         Input("current-page", "data")]
+    )
+    def update_positions_table(_, current_page):
+        """Update the positions table"""
+        if current_page != "portfolio":
+            return html.Div()
+        
+        # Check if we have a trader instance
+        if not monitor.trader:
+            return html.Div("No trading account connected. Please check your API credentials.", 
+                           className="alert alert-warning")
+        
+        try:
+            # Get positions
+            positions = monitor.trader.get_positions()
+            
+            if not positions:
+                return html.Div("No open positions.", className="alert alert-info")
+            
+            # Create table header
+            header = html.Thead(html.Tr([
+                html.Th("Symbol", className="text-center"),
+                html.Th("Quantity", className="text-center"),
+                html.Th("Entry Price", className="text-center"),
+                html.Th("Current Price", className="text-center"),
+                html.Th("Market Value", className="text-center"),
+                html.Th("Unrealized P&L", className="text-center"),
+                html.Th("P&L %", className="text-center"),
+                html.Th("Actions", className="text-center"),
+            ]))
+            
+            # Create table rows
+            rows = []
+            for position in positions:
+                # Calculate P&L
+                entry_price = float(position.get('avg_entry_price', 0))
+                current_price = float(position.get('current_price', 0))
+                quantity = float(position.get('qty', 0))
+                
+                market_value = current_price * quantity
+                cost_basis = entry_price * quantity
+                unrealized_pl = market_value - cost_basis
+                pl_pct = (unrealized_pl / cost_basis) * 100 if cost_basis else 0
+                
+                # Determine P&L color
+                pl_color = "text-success" if unrealized_pl >= 0 else "text-danger"
+                pl_sign = "+" if unrealized_pl >= 0 else ""
+                
+                # Create row
+                row = html.Tr([
+                    html.Td(position.get('symbol', ''), className="text-center"),
+                    html.Td(f"{quantity:.0f}", className="text-center"),
+                    html.Td(f"${entry_price:.2f}", className="text-center"),
+                    html.Td(f"${current_price:.2f}", className="text-center"),
+                    html.Td(f"${market_value:.2f}", className="text-center"),
+                    html.Td(f"{pl_sign}${abs(unrealized_pl):.2f}", className=f"text-center {pl_color}"),
+                    html.Td(f"{pl_sign}{abs(pl_pct):.2f}%", className=f"text-center {pl_color}"),
+                    html.Td(
+                        dbc.Button("Close", color="danger", size="sm", className="mx-1", id={"type": "close-position", "symbol": position.get('symbol', '')}),
+                    ),
+                ])
+                rows.append(row)
+            
+            # Create table
+            table = dbc.Table([
+                header,
+                html.Tbody(rows)
+            ], bordered=True, hover=True, responsive=True, striped=True, className="positions-table")
+            
+            return table
+            
+        except Exception as e:
+            print(f"Error fetching positions: {e}")
+            return html.Div(f"Error fetching positions: {str(e)}", 
+                           className="alert alert-danger")
+    
+    @app.callback(
+        Output("order-history", "children"),
+        [Input("interval-component", "n_intervals"),
+         Input("current-page", "data")]
+    )
+    def update_order_history(_, current_page):
+        """Update the order history table"""
+        if current_page != "portfolio":
+            return html.Div()
+        
+        # Check if we have a trader instance
+        if not monitor.trader:
+            return html.Div("No trading account connected. Please check your API credentials.", 
+                           className="alert alert-warning")
+        
+        try:
+            # Get order history
+            orders = monitor.trader.get_order_history()
+            
+            if not orders:
+                return html.Div("No order history available.", className="alert alert-info")
+            
+            # Create table header
+            header = html.Thead(html.Tr([
+                html.Th("Date", className="text-center"),
+                html.Th("Symbol", className="text-center"),
+                html.Th("Side", className="text-center"),
+                html.Th("Quantity", className="text-center"),
+                html.Th("Price", className="text-center"),
+                html.Th("Status", className="text-center"),
+                html.Th("Type", className="text-center"),
+            ]))
+            
+            # Create table rows
+            rows = []
+            for order in orders:
+                # Determine status color
+                status = order.get('status', '')
+                status_color = ""
+                if status == 'filled':
+                    status_color = "text-success"
+                elif status == 'canceled' or status == 'rejected':
+                    status_color = "text-danger"
+                elif status == 'pending' or status == 'accepted':
+                    status_color = "text-warning"
+                
+                # Determine side color
+                side = order.get('side', '')
+                side_color = "text-success" if side == 'buy' else "text-danger"
+                
+                # Format date
+                created_at = order.get('created_at', '')
+                if created_at:
+                    try:
+                        dt_obj = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        created_at = dt_obj.strftime('%Y-%m-%d %H:%M:%S')
+                    except:
+                        pass
+                
+                # Create row
+                row = html.Tr([
+                    html.Td(created_at, className="text-center"),
+                    html.Td(order.get('symbol', ''), className="text-center"),
+                    html.Td(side.capitalize(), className=f"text-center {side_color}"),
+                    html.Td(order.get('qty', ''), className="text-center"),
+                    html.Td(f"${float(order.get('filled_avg_price', 0)):.2f}" if order.get('filled_avg_price') else "-", 
+                           className="text-center"),
+                    html.Td(status.capitalize(), className=f"text-center {status_color}"),
+                    html.Td(order.get('type', '').capitalize(), className="text-center"),
+                ])
+                rows.append(row)
+            
+            # Create table
+            table = dbc.Table([
+                header,
+                html.Tbody(rows)
+            ], bordered=True, hover=True, responsive=True, striped=True, className="order-history-table")
+            
+            return table
+            
+        except Exception as e:
+            print(f"Error fetching order history: {e}")
+            return html.Div(f"Error fetching order history: {str(e)}", 
+                           className="alert alert-danger")
+
+    # Add callback for IV chart
+    @app.callback(
+        Output("iv-chart", "figure"),
+        [Input("ticker-dropdown", "value"),
+         Input("interval-component", "n_intervals")]
+    )
+    def update_iv_chart(ticker, _):
+        """Update the implied volatility chart"""
+        if not ticker:
+            return {
+                "data": [],
+                "layout": {
+                    "title": "Select a ticker to view implied volatility",
+                    "xaxis": {"title": "Strike Price"},
+                    "yaxis": {"title": "Implied Volatility (%)"},
+                    "showlegend": True,
+                    "template": "plotly_dark"
+                }
+            }
+        
+        # Get options data
+        options_data = monitor.options_data.get(ticker, {})
+        if not options_data or 'calls' not in options_data or 'puts' not in options_data:
+            return {
+                "data": [],
+                "layout": {
+                    "title": f"No options data available for {ticker}",
+                    "xaxis": {"title": "Strike Price"},
+                    "yaxis": {"title": "Implied Volatility (%)"},
+                    "showlegend": True,
+                    "template": "plotly_dark"
+                }
+            }
+        
+        # Get current stock price
+        stock_price = monitor.data.get(ticker, {}).get('price')
+        if not stock_price:
+            return {
+                "data": [],
+                "layout": {
+                    "title": f"Stock price data not available for {ticker}",
+                    "xaxis": {"title": "Strike Price"},
+                    "yaxis": {"title": "Implied Volatility (%)"},
+                    "showlegend": True,
+                    "template": "plotly_dark"
+                }
+            }
+        
+        # Extract data for calls and puts
+        calls = options_data.get('calls', [])
+        puts = options_data.get('puts', [])
+        
+        # Sort by strike price
+        calls = sorted(calls, key=lambda x: x['strike'])
+        puts = sorted(puts, key=lambda x: x['strike'])
+        
+        # Extract strike prices and implied volatilities
+        call_strikes = [c['strike'] for c in calls if 'strike' in c and 'impliedVolatility' in c]
+        call_ivs = [c['impliedVolatility'] * 100 for c in calls if 'strike' in c and 'impliedVolatility' in c]
+        
+        put_strikes = [p['strike'] for p in puts if 'strike' in p and 'impliedVolatility' in p]
+        put_ivs = [p['impliedVolatility'] * 100 for p in puts if 'strike' in p and 'impliedVolatility' in p]
+        
+        # Create the figure
+        fig = {
+            "data": [
+                {
+                    "x": call_strikes,
+                    "y": call_ivs,
+                    "type": "scatter",
+                    "mode": "lines+markers",
+                    "name": "Calls IV",
+                    "line": {"color": "green", "width": 2},
+                    "marker": {"size": 8}
+                },
+                {
+                    "x": put_strikes,
+                    "y": put_ivs,
+                    "type": "scatter",
+                    "mode": "lines+markers",
+                    "name": "Puts IV",
+                    "line": {"color": "red", "width": 2},
+                    "marker": {"size": 8}
+                },
+                {
+                    "x": [stock_price, stock_price],
+                    "y": [0, max(max(call_ivs) if call_ivs else 0, max(put_ivs) if put_ivs else 0) * 1.1],
+                    "type": "scatter",
+                    "mode": "lines",
+                    "name": "Current Price",
+                    "line": {"color": "yellow", "width": 2, "dash": "dash"}
+                }
+            ],
+            "layout": {
+                "title": f"{ticker} Implied Volatility Curve",
+                "xaxis": {
+                    "title": "Strike Price ($)",
+                    "gridcolor": "rgba(255, 255, 255, 0.1)",
+                    "zerolinecolor": "rgba(255, 255, 255, 0.1)"
+                },
+                "yaxis": {
+                    "title": "Implied Volatility (%)",
+                    "gridcolor": "rgba(255, 255, 255, 0.1)",
+                    "zerolinecolor": "rgba(255, 255, 255, 0.1)"
+                },
+                "showlegend": True,
+                "legend": {"orientation": "h", "y": 1.1},
+                "template": "plotly_dark",
+                "hovermode": "closest",
+                "plot_bgcolor": "rgba(0, 0, 0, 0)",
+                "paper_bgcolor": "rgba(0, 0, 0, 0)",
+                "font": {"color": "white"}
+            }
+        }
+        
+        return fig
+
+    # Add callback for order status
+    @app.callback(
+        Output("order-status", "children"),
+        [Input("order-submit", "n_clicks")],
+        [State("order-ticker", "value"),
+         State("order-expiration", "value"),
+         State("order-strike", "value"),
+         State("order-quantity", "value"),
+         State("order-type", "value"),
+         State("order-option-type", "value"),
+         State("order-price", "value")]
+    )
+    def submit_order(n_clicks, ticker, expiration, strike, quantity, order_type, option_type, price):
+        """Submit an order and show the status"""
+        if not n_clicks:
+            return html.Div()
+        
+        if not ticker or not expiration or not strike or not quantity or not order_type or not option_type:
+            return html.Div("Please fill in all required fields", className="alert alert-warning")
+        
+        # Check if we have a trader instance
+        if not monitor.trader:
+            return html.Div("No trading account connected. Please check your API credentials.", 
+                           className="alert alert-warning")
+        
+        try:
+            # Convert inputs to appropriate types
+            strike = float(strike)
+            quantity = int(quantity)
+            price = float(price) if price else None
+            
+            # Submit the order
+            if order_type == 'buy':
+                result = monitor.trader.buy_option(
+                    ticker=ticker,
+                    expiration=expiration,
+                    strike=strike,
+                    option_type=option_type,
+                    quantity=quantity,
+                    price=price
+                )
+            else:  # sell
+                result = monitor.trader.sell_option(
+                    ticker=ticker,
+                    expiration_date=expiration,
+                    strike_price=strike,
+                    option_type=option_type,
+                    quantity=quantity,
+                    price=price
+                )
+            
+            # Check if the order was successful
+            if result.get('error', False):
+                return html.Div([
+                    html.H5("Order Rejected", className="text-danger"),
+                    html.P(f"Reason: {result.get('error_message', 'Unknown error')}"),
+                    html.Hr(),
+                    html.Pre(json.dumps(result, indent=2), 
+                            style={"backgroundColor": "#f8f9fa", "padding": "10px", "borderRadius": "5px"})
+                ], className="alert alert-danger")
+            
+            # Order was successful
+            status = result.get('status', 'unknown')
+            status_color = "success" if status in ['filled', 'accepted'] else "warning"
+            
+            return html.Div([
+                html.H5(f"Order {status.capitalize()}", className=f"text-{status_color}"),
+                html.P([
+                    f"{order_type.capitalize()} {quantity} {ticker} {option_type.upper()} ",
+                    html.Strong(f"${strike}"),
+                    f" {expiration}"
+                ]),
+                html.P([
+                    "Order ID: ",
+                    html.Code(result.get('id', 'N/A'))
+                ]),
+                html.P([
+                    "Filled Price: ",
+                    html.Strong(f"${result.get('filled_avg_price', 'N/A')}")
+                ]) if result.get('filled_avg_price') else html.P("Awaiting fill..."),
+                html.Hr(),
+                html.Pre(json.dumps(result, indent=2), 
+                        style={"backgroundColor": "#f8f9fa", "padding": "10px", "borderRadius": "5px"})
+            ], className=f"alert alert-{status_color}")
+            
+        except Exception as e:
+            return html.Div([
+                html.H5("Error Submitting Order", className="text-danger"),
+                html.P(str(e)),
+            ], className="alert alert-danger")
+
     return app
 
 def start_dashboard(monitor, port=8050, debug=False):
@@ -1468,8 +1967,8 @@ def start_dashboard(monitor, port=8050, debug=False):
 def main():
     """Main function to run the options monitor dashboard"""
     parser = argparse.ArgumentParser(description='Options Monitor Dashboard')
-    parser.add_argument('--tickers', nargs='+', default=['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA'],
-                        help='List of stock tickers to monitor')
+    parser.add_argument('--tickers', type=str, default='AAPL,MSFT,GOOGL,AMZN,TSLA',
+                        help='Comma-separated list of stock tickers to monitor')
     parser.add_argument('--refresh', type=int, default=60,
                         help='Data refresh interval in seconds')
     parser.add_argument('--port', type=int, default=8050,
@@ -1479,10 +1978,13 @@ def main():
     
     args = parser.parse_args()
     
-    print(f"Starting Options Monitor Dashboard with tickers: {', '.join(args.tickers)}")
+    # Parse comma-separated tickers
+    tickers = [ticker.strip() for ticker in args.tickers.split(',') if ticker.strip()]
+    
+    print(f"Starting Options Monitor Dashboard with tickers: {', '.join(tickers)}")
     print(f"Data will refresh every {args.refresh} seconds")
     
-    monitor = OptionsMonitor(args.tickers, refresh_interval=args.refresh)
+    monitor = OptionsMonitor(tickers, refresh_interval=args.refresh)
     
     try:
         start_dashboard(monitor, port=args.port, debug=args.debug)
