@@ -17,10 +17,12 @@ A Python application for monitoring and trading options using the Alpaca API.
 
 ## Installation
 
+### Method 1: Clone and Install Dependencies
+
 1. Clone the repository:
    ```
-   git clone https://github.com/leoasa/options_trader.git
-   cd options_trader
+   git clone https://github.com/leoasa/options_alg_trader.git
+   cd options_alg_trader
    ```
 
 2. Create a virtual environment:
@@ -34,13 +36,73 @@ A Python application for monitoring and trading options using the Alpaca API.
    pip install -r requirements.txt
    ```
 
-4. Set up environment variables:
-   Create a `.env` file in the root directory with the following variables:
-   ```
-   ALPACA_API_KEY=your_alpaca_api_key
-   ALPACA_API_SECRET=your_alpaca_api_secret
-   ALPACA_API_BASE_URL=https://paper-api.alpaca.markets  # Use paper trading for testing
-   ```
+### Method 2: Install as a Package
+
+You can also install the package directly using pip:
+
+```
+pip install git+https://github.com/leoasa/options_alg_trader.git
+```
+
+Or install it in development mode:
+
+```
+git clone https://github.com/leoasa/options_alg_trader.git
+cd options_alg_trader
+pip install -e .
+```
+
+### Environment Setup
+
+Create a `.env` file in the root directory with the following variables:
+
+```
+ALPACA_API_KEY=your_alpaca_api_key
+ALPACA_API_SECRET=your_alpaca_api_secret
+ALPACA_API_BASE_URL=https://paper-api.alpaca.markets  # Use paper trading for testing
+```
+
+You can copy the `.env.example` file provided in the repository:
+
+```
+cp .env.example .env
+```
+
+Then edit the `.env` file with your actual Alpaca API credentials.
+
+## Configuration Files
+
+### Portfolio Files
+
+The application uses JSON files to track portfolio information:
+
+- `portfolio.json`: Used for real trading with Alpaca API
+- `simulated_portfolio.json`: Used for simulated trading without actual orders
+
+Both files are initialized with default values:
+
+**portfolio.json**
+```json
+{
+  "cash": 100000.0,
+  "positions": [],
+  "orders": [],
+  "transactions": []
+}
+```
+
+**simulated_portfolio.json**
+```json
+{
+  "cash": 100000.0,
+  "buying_power": 200000.0,
+  "equity": 100000.0,
+  "positions": [],
+  "transactions": []
+}
+```
+
+You can modify these files to adjust your starting capital or to import existing positions.
 
 ## Usage
 
@@ -50,6 +112,12 @@ Monitor stock prices and options data from the command line:
 
 ```
 python -m options_trader.cli_monitor --tickers AAPL,MSFT,GOOGL --refresh 60
+```
+
+If installed as a package:
+
+```
+options-cli --tickers AAPL,MSFT,GOOGL --refresh 60
 ```
 
 Options:
@@ -64,6 +132,12 @@ Launch the interactive web dashboard:
 python -m options_trader.options_monitor --tickers AAPL,MSFT,GOOGL --port 8050
 ```
 
+If installed as a package:
+
+```
+options-monitor --tickers AAPL,MSFT,GOOGL --port 8050
+```
+
 Options:
 - `--tickers`: Comma-separated list of stock tickers to monitor
 - `--port`: Port number for the web server (default: 8050)
@@ -75,6 +149,14 @@ Options:
   - `option_trader.py`: Core trading functionality
   - `options_monitor.py`: Web dashboard for monitoring
   - `cli_monitor.py`: Command-line interface
+- `tests/`: Test files
+  - `test_options_trading.py`: Unit tests for options trading functionality
+  - `test_integration.py`: Integration tests
+  - `test_runner.py`: Custom test runner
+- `portfolio.json`: Real trading portfolio configuration
+- `simulated_portfolio.json`: Simulated trading portfolio configuration
+- `setup.py`: Package installation configuration
+- `.env.example`: Example environment variables file
 
 ## Tests
 
@@ -151,6 +233,14 @@ The application caches data to improve performance. Cache files are stored in pl
 - **Windows**: `C:\Users\<username>\AppData\Local\options_trader\Cache\`
 
 Note: To manually clear the cache, you can delete the cache directories above.
+
+## Current Limitations
+
+Please note the following limitations of the current implementation:
+
+1. **Configuration Required**: Tickers, options chain settings, and order placement parameters need to be modified to work with your specific requirements.
+2. **No Database**: There is currently no database to save trades or user information. All data is stored in JSON files.
+3. **Paper Trading**: By default, the system is configured for paper trading. Modify the `.env` file to switch to live trading.
 
 ## Tech Stack
 
