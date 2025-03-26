@@ -7,6 +7,7 @@ import alpaca_trade_api as tradeapi
 from alpaca_trade_api.rest import APIError
 import time
 import random
+import requests
 
 class OptionTrader:
     """
@@ -25,33 +26,50 @@ class OptionTrader:
         self.base_url = base_url or os.environ.get('ALPACA_API_BASE_URL', 'https://paper-api.alpaca.markets')
         self.data_url = data_url or os.environ.get('ALPACA_DATA_URL', 'https://data.alpaca.markets')
         
-        # Initialize API connection if credentials are available
-        if self.api_key and self.api_secret:
-            try:
-                print(f"Initializing Alpaca API with base_url: {self.base_url}")
-                self.api = tradeapi.REST(
-                    self.api_key,
-                    self.api_secret,
-                    self.base_url,
-                    api_version='v2'
-                )
-                
-                # Test the connection
-                try:
-                    account = self.api.get_account()
-                    print(f"Successfully connected to Alpaca API. Account ID: {account.id}")
-                except Exception as test_error:
-                    print(f"Warning: API initialized but test connection failed: {test_error}")
-            except Exception as e:
-                print(f"Error connecting to Alpaca API: {e}")
-                self.api = None
-        else:
-            print("No Alpaca API credentials found. Running in simulation mode.")
-            self.api = None
+        # Initialize API connection
+        self.api = self._init_alpaca_api()
         
         # Initialize simulated portfolio if in simulation mode
         if self.api is None:
+            self.simulation_mode = True
             self._initialize_simulation()
+    
+    def _init_alpaca_api(self):
+        """Initialize and test connection to Alpaca API"""
+        if not self.api_key or not self.api_secret:
+            print("No Alpaca API credentials found. Running in simulation mode.")
+            return None
+            
+        try:
+            print(f"Initializing Alpaca API with base_url: {self.base_url}")
+            api = tradeapi.REST(
+                self.api_key,
+                self.api_secret,
+                self.base_url,
+                api_version='v2'
+            )
+            
+            # Test the connection
+            try:
+                account = api.get_account()
+                print(f"Successfully connected to Alpaca API. Account ID: {account.id}")
+                print(f"Successfully connected to Alpaca API")
+                print(f"Connected to Alpaca account: {account.id} (Status: {account.status})")
+                
+                # Check if market is open
+                clock = api.get_clock()
+                if clock.is_open:
+                    print("Market is open")
+                else:
+                    print("Market is closed")
+                
+                return api
+            except Exception as test_error:
+                print(f"Warning: API initialized but test connection failed: {test_error}")
+                return None
+        except Exception as e:
+            print(f"Error connecting to Alpaca API: {e}")
+            return None
     
     def _initialize_simulation(self):
         """Initialize simulation mode with a simulated portfolio"""
@@ -194,9 +212,11 @@ class OptionTrader:
         """
         # Format the option symbol
         option_symbol = self.format_option_symbol(ticker, expiration, strike, option_type)
+        print(f"Attempting to buy {quantity} {option_symbol} contracts")
         
         # Check if we're in simulation mode
         if self.simulation_mode:
+            print(f"Running in simulation mode for {option_symbol}")
             # Simulate buying an option
             if not self.simulated_portfolio:
                 self._initialize_simulation()
@@ -209,6 +229,7 @@ class OptionTrader:
                 cost = self._get_simulated_price(ticker, strike, option_type) * 100 * quantity
             
             if cost > self.simulated_portfolio['buying_power']:
+                print(f"Insufficient buying power: {self.simulated_portfolio['buying_power']} < {cost}")
                 return {
                     'status': 'rejected',
                     'reason': 'Insufficient buying power',
@@ -221,7 +242,7 @@ class OptionTrader:
                     'id': f"sim_{int(time.time())}",
                     'created_at': dt.datetime.now().isoformat(),
                     'error': True,
-                    'error_message': 'Insufficient buying power'
+                    'error_message': f'Insufficient buying power: {self.simulated_portfolio["buying_power"]} < {cost}'
                 }
             
             # Simulate the order
@@ -281,6 +302,7 @@ class OptionTrader:
             
             # Save portfolio
             self._save_portfolio()
+            print(f"Simulated buy order filled: {quantity} {option_symbol} at ${filled_price}")
             
             # Return order information
             return {
@@ -298,6 +320,7 @@ class OptionTrader:
         
         # Real trading with Alpaca API
         if not self.api:
+            print("No API connection for real trading")
             return {
                 'status': 'rejected',
                 'reason': 'No API connection',
@@ -317,11 +340,29 @@ class OptionTrader:
             # Check account buying power
             account = self.api.get_account()
             buying_power = float(account.buying_power)
+            print(f"Account buying power: ${buying_power}")
             
-            # Estimate cost (very rough estimate)
-            estimated_cost = strike * 0.1 * 100 * quantity  # Assume premium is ~10% of strike
+            # Try to get actual option price to estimate cost
+            try:
+                option_snapshot = self._get_option_snapshot(option_symbol)
+                if option_snapshot and 'quote' in option_snapshot:
+                    ask_price = option_snapshot['quote'].get('ask_price', None)
+                    if ask_price:
+                        estimated_cost = float(ask_price) * 100 * quantity
+                        print(f"Using ask price ${ask_price} for cost estimate")
+                    else:
+                        estimated_cost = strike * 0.1 * 100 * quantity
+                        print(f"No ask price found, using estimate: ${estimated_cost}")
+                else:
+                    estimated_cost = strike * 0.1 * 100 * quantity
+                    print(f"No option snapshot available, using estimate: ${estimated_cost}")
+            except Exception as e:
+                print(f"Error getting option price: {e}")
+                estimated_cost = strike * 0.1 * 100 * quantity
+                print(f"Using fallback cost estimate: ${estimated_cost}")
             
             if estimated_cost > buying_power:
+                print(f"Insufficient buying power: ${buying_power} < ${estimated_cost}")
                 return {
                     'status': 'rejected',
                     'reason': 'Insufficient buying power',
@@ -334,7 +375,7 @@ class OptionTrader:
                     'id': None,
                     'created_at': dt.datetime.now().isoformat(),
                     'error': True,
-                    'error_message': 'Insufficient buying power'
+                    'error_message': f'Insufficient buying power: ${buying_power} < ${estimated_cost}'
                 }
             
             # Submit the order
@@ -350,7 +391,9 @@ class OptionTrader:
             if price is not None:
                 order_args['limit_price'] = price
             
+            print(f"Submitting order: {order_args}")
             order = self.api.submit_order(**order_args)
+            print(f"Order submitted: {order.id}, status: {order.status}")
             
             # Return order information
             return {
@@ -367,6 +410,7 @@ class OptionTrader:
             }
         except APIError as e:
             # Handle API errors
+            print(f"Alpaca API Error: {e}")
             return {
                 'status': 'rejected',
                 'reason': str(e),
@@ -383,6 +427,7 @@ class OptionTrader:
             }
         except Exception as e:
             # Handle other errors
+            print(f"Unexpected error: {e}")
             return {
                 'status': 'rejected',
                 'reason': str(e),
@@ -397,6 +442,49 @@ class OptionTrader:
                 'error': True,
                 'error_message': str(e)
             }
+    
+    def _get_option_snapshot(self, option_symbol):
+        """
+        Get current snapshot data for an option symbol
+        
+        Args:
+            option_symbol (str): Option symbol in OCC format
+            
+        Returns:
+            dict: Option snapshot data
+        """
+        if not self.api_key or not self.api_secret:
+            print(f"No API credentials to get option snapshot for {option_symbol}")
+            return None
+            
+        try:
+            url = f"{self.data_url}/v1beta1/options/snapshots"
+            headers = {
+                'APCA-API-KEY-ID': self.api_key,
+                'APCA-API-SECRET-KEY': self.api_secret
+            }
+            params = {
+                'symbols': option_symbol,
+                'feed': 'indicative'  # Use indicative feed if no subscription
+            }
+            
+            print(f"Requesting option snapshot for {option_symbol}")
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                # Check if the option symbol is in the response
+                if option_symbol in data:
+                    return data[option_symbol]
+                else:
+                    print(f"Option {option_symbol} not found in response")
+                    return None
+            else:
+                print(f"Error fetching option snapshot: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            print(f"Error getting option snapshot: {e}")
+            return None
     
     def sell_option(self, ticker, expiration_date, strike_price, option_type, quantity, price=None):
         """
@@ -415,9 +503,11 @@ class OptionTrader:
         """
         # Format the option symbol
         option_symbol = self.format_option_symbol(ticker, expiration_date, strike_price, option_type)
+        print(f"Attempting to sell {quantity} {option_symbol} contracts")
         
         # Check if we're in simulation mode
         if self.simulation_mode:
+            print(f"Running in simulation mode for {option_symbol}")
             # Simulate selling an option
             if not self.simulated_portfolio:
                 self._initialize_simulation()
@@ -429,27 +519,13 @@ class OptionTrader:
                 if position['symbol'] == option_symbol:
                     position_found = True
                     position_index = i
-                    if position['qty'] < quantity:
-                        return {
-                            'status': 'rejected',
-                            'reason': 'Insufficient position quantity',
-                            'symbol': option_symbol,
-                            'side': 'sell',
-                            'qty': quantity,
-                            'type': 'market' if price is None else 'limit',
-                            'limit_price': price,
-                            'filled_avg_price': None,
-                            'id': f"sim_{int(time.time())}",
-                            'created_at': dt.datetime.now().isoformat(),
-                            'error': True,
-                            'error_message': 'Insufficient position quantity'
-                        }
                     break
             
-            if not position_found:
+            if not position_found or self.simulated_portfolio['positions'][position_index]['qty'] < quantity:
+                print(f"Insufficient position to sell: {0 if not position_found else self.simulated_portfolio['positions'][position_index]['qty']} < {quantity}")
                 return {
                     'status': 'rejected',
-                    'reason': 'Position not found',
+                    'reason': 'Insufficient position',
                     'symbol': option_symbol,
                     'side': 'sell',
                     'qty': quantity,
@@ -459,31 +535,31 @@ class OptionTrader:
                     'id': f"sim_{int(time.time())}",
                     'created_at': dt.datetime.now().isoformat(),
                     'error': True,
-                    'error_message': 'Position not found'
+                    'error_message': 'Insufficient position'
                 }
             
             # Simulate the order
             filled_price = self._get_simulated_price(ticker, strike_price, option_type)
             proceeds = filled_price * 100 * quantity
             
+            # Calculate P&L
+            position = self.simulated_portfolio['positions'][position_index]
+            entry_price = position['avg_entry_price']
+            profit_loss = (filled_price - entry_price) * 100 * quantity
+            print(f"Simulated P&L: ${profit_loss} (entry: ${entry_price}, exit: ${filled_price})")
+            
             # Update portfolio
             self.simulated_portfolio['cash'] += proceeds
             self.simulated_portfolio['buying_power'] += proceeds
             
             # Update position
-            position = self.simulated_portfolio['positions'][position_index]
             if position['qty'] == quantity:
-                # Remove position if selling all
-                realized_pl = (filled_price - position['avg_entry_price']) * 100 * quantity
+                # Remove the position entirely
                 del self.simulated_portfolio['positions'][position_index]
             else:
-                # Update position if selling partial
-                realized_pl = (filled_price - position['avg_entry_price']) * 100 * quantity
+                # Reduce the position
                 position['qty'] -= quantity
-                position['market_value'] = position['qty'] * filled_price * 100
-            
-            # Update equity with realized P&L
-            self.simulated_portfolio['equity'] += realized_pl
+                position['market_value'] = position['qty'] * position['current_price'] * 100
             
             # Add to transactions
             transaction = {
@@ -493,7 +569,7 @@ class OptionTrader:
                 'qty': quantity,
                 'price': filled_price,
                 'proceeds': proceeds,
-                'realized_pl': realized_pl,
+                'profit_loss': profit_loss,
                 'type': 'option',
                 'option_type': option_type,
                 'strike': strike_price,
@@ -505,6 +581,7 @@ class OptionTrader:
             
             # Save portfolio
             self._save_portfolio()
+            print(f"Simulated sell order filled: {quantity} {option_symbol} at ${filled_price}")
             
             # Return order information
             return {
@@ -515,6 +592,8 @@ class OptionTrader:
                 'type': 'market' if price is None else 'limit',
                 'limit_price': price,
                 'filled_avg_price': filled_price,
+                'proceeds': proceeds,
+                'profit_loss': profit_loss,
                 'id': transaction['id'],
                 'created_at': transaction['timestamp'],
                 'success': True
@@ -522,6 +601,7 @@ class OptionTrader:
         
         # Real trading with Alpaca API
         if not self.api:
+            print("No API connection for real trading")
             return {
                 'status': 'rejected',
                 'reason': 'No API connection',
@@ -540,11 +620,21 @@ class OptionTrader:
         try:
             # Check if we have the position
             try:
-                position = self.api.get_position(option_symbol)
-                if int(position.qty) < quantity:
+                positions = self.api.list_positions()
+                position_found = False
+                position_qty = 0
+                
+                for p in positions:
+                    if p.symbol == option_symbol:
+                        position_found = True
+                        position_qty = int(p.qty)
+                        break
+                
+                if not position_found or position_qty < quantity:
+                    print(f"Insufficient position to sell: {position_qty} < {quantity}")
                     return {
                         'status': 'rejected',
-                        'reason': 'Insufficient position quantity',
+                        'reason': 'Insufficient position',
                         'symbol': option_symbol,
                         'side': 'sell',
                         'qty': quantity,
@@ -554,24 +644,11 @@ class OptionTrader:
                         'id': None,
                         'created_at': dt.datetime.now().isoformat(),
                         'error': True,
-                        'error_message': 'Insufficient position quantity'
+                        'error_message': f'Insufficient position: {position_qty} < {quantity}'
                     }
             except Exception as e:
-                # Position not found
-                return {
-                    'status': 'rejected',
-                    'reason': 'Position not found',
-                    'symbol': option_symbol,
-                    'side': 'sell',
-                    'qty': quantity,
-                    'type': 'market' if price is None else 'limit',
-                    'limit_price': price,
-                    'filled_avg_price': None,
-                    'id': None,
-                    'created_at': dt.datetime.now().isoformat(),
-                    'error': True,
-                    'error_message': 'Position not found'
-                }
+                print(f"Error checking positions: {e}")
+                # Continue anyway, the order will be rejected by Alpaca if we don't have the position
             
             # Submit the order
             order_type = 'market' if price is None else 'limit'
@@ -586,7 +663,9 @@ class OptionTrader:
             if price is not None:
                 order_args['limit_price'] = price
             
+            print(f"Submitting order: {order_args}")
             order = self.api.submit_order(**order_args)
+            print(f"Order submitted: {order.id}, status: {order.status}")
             
             # Return order information
             return {
@@ -603,6 +682,7 @@ class OptionTrader:
             }
         except APIError as e:
             # Handle API errors
+            print(f"Alpaca API Error: {e}")
             return {
                 'status': 'rejected',
                 'reason': str(e),
@@ -619,6 +699,7 @@ class OptionTrader:
             }
         except Exception as e:
             # Handle other errors
+            print(f"Unexpected error: {e}")
             return {
                 'status': 'rejected',
                 'reason': str(e),

@@ -26,29 +26,108 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from options_trader.option_trader import OptionTrader
 
 class OptionsMonitor:
-    def __init__(self, tickers, refresh_interval=60):
-        """
-        Initialize the options monitor.
+    def __init__(self, tickers=None, debug=False):
+        """Initialize the options monitor with specified tickers"""
+        # Default tickers if none specified
+        self.tickers = tickers if tickers else ["SPY", "AAPL", "TSLA", "MSFT", "AMZN"]
+        self.debug = debug
         
-        Args:
-            tickers (list): List of stock tickers to monitor
-            refresh_interval (int): Data refresh interval in seconds
-        """
-        self.tickers = tickers
-        self.refresh_interval = refresh_interval
+        if self.debug:
+            print(f"Debug mode enabled")
+        
+        # Initialize data storage
         self.data = {}
         self.options_data = {}
         self.last_update = None
+        self.refresh_interval = 30  # seconds
         
-        # Initialize Alpaca API if credentials are available
-        self.api = None
-        self.trader = None
+        # Load saved tickers if available
+        self._load_config()
+        
+        # Initialize Alpaca API connection
         self._init_alpaca_api()
         
-        # Start data refresh thread
+        # Fetch initial data
+        self.refresh_data()
+        
+        # Start background refresh thread
         self.refresh_thread = threading.Thread(target=self._refresh_loop)
         self.refresh_thread.daemon = True
         self.refresh_thread.start()
+    
+    def _load_config(self):
+        """Load configuration from file"""
+        config_file = os.path.join(os.path.dirname(__file__), 'monitor_config.json')
+        try:
+            if os.path.exists(config_file):
+                with open(config_file, 'r') as f:
+                    config = json.load(f)
+                    
+                    # Load tickers from config
+                    saved_tickers = config.get('tickers', [])
+                    if saved_tickers:
+                        print(f"Loaded {len(saved_tickers)} tickers from configuration")
+                        # Merge saved tickers with defaults, removing duplicates
+                        self.tickers = list(set(self.tickers + saved_tickers))
+                    
+                    # Load other settings
+                    self.refresh_interval = config.get('refresh_interval', self.refresh_interval)
+                    
+                    print(f"Configuration loaded successfully: {len(self.tickers)} tickers, refresh every {self.refresh_interval}s")
+        except Exception as e:
+            print(f"Error loading configuration: {e}")
+    
+    def _save_config(self):
+        """Save configuration to file"""
+        config_file = os.path.join(os.path.dirname(__file__), 'monitor_config.json')
+        try:
+            config = {
+                'tickers': self.tickers,
+                'refresh_interval': self.refresh_interval,
+                'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S') if self.last_update else None
+            }
+            
+            with open(config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+                
+            print(f"Configuration saved successfully: {len(self.tickers)} tickers")
+            return True
+        except Exception as e:
+            print(f"Error saving configuration: {e}")
+            return False
+    
+    def add_ticker(self, ticker):
+        """Add a ticker to the watchlist and save configuration"""
+        ticker = ticker.strip().upper()
+        if ticker and ticker not in self.tickers:
+            self.tickers.append(ticker)
+            # Fetch data for the new ticker
+            try:
+                self.data[ticker] = self.fetch_stock_data(ticker)
+                self.options_data[ticker] = self.fetch_options_data(ticker)
+                # Save configuration
+                self._save_config()
+                print(f"Added ticker {ticker} to watchlist and saved configuration")
+                return True
+            except Exception as e:
+                print(f"Error adding ticker {ticker}: {e}")
+        return False
+    
+    def remove_ticker(self, ticker):
+        """Remove a ticker from the watchlist and save configuration"""
+        ticker = ticker.strip().upper()
+        if ticker in self.tickers:
+            self.tickers.remove(ticker)
+            # Remove data
+            if ticker in self.data:
+                del self.data[ticker]
+            if ticker in self.options_data:
+                del self.options_data[ticker]
+            # Save configuration
+            self._save_config()
+            print(f"Removed ticker {ticker} from watchlist and saved configuration")
+            return True
+        return False
     
     def _init_alpaca_api(self):
         """Initialize Alpaca API connection"""
@@ -121,7 +200,7 @@ class OptionsMonitor:
             # Round to nearest minute for caching
             timestamp = datetime.now().replace(second=0, microsecond=0)
         
-        if not self.api:
+        if not self.api and not self.trader:
             print(f"No API access for {ticker} stock data")
             return self._create_empty_stock_data()
         
@@ -129,95 +208,111 @@ class OptionsMonitor:
             print(f"Fetching stock data for {ticker}...")
             
             # Get asset information
+            asset_info = None
             try:
-                asset = self.api.get_asset(ticker)
-                print(f"Asset info for {ticker}: {asset.symbol}, tradable: {asset.tradable}")
+                if self.api:
+                    asset = self.api.get_asset(ticker)
+                    asset_info = {
+                        'symbol': asset.symbol,
+                        'name': asset.name if hasattr(asset, 'name') else None,
+                        'tradable': asset.tradable
+                    }
+                    print(f"Asset info for {ticker}: {asset.symbol}, tradable: {asset.tradable}")
             except Exception as asset_error:
                 print(f"Error getting asset info for {ticker}: {asset_error}")
                 # Continue anyway, as we might still get price data
             
-            # Try to get latest market data using the Alpaca API
-            try:
-                # First try using the get_bars method
-                print(f"Trying to get bars for {ticker}...")
-                bars = self.api.get_bars(ticker, '1Day', limit=1).df
-                
-                if bars.empty:
-                    print(f"No bar data found for {ticker}, trying alternative method...")
-                    # If no bars, try using the get_latest_trade method if available
-                    if hasattr(self.api, 'get_latest_trade'):
-                        latest_trade = self.api.get_latest_trade(ticker)
-                        print(f"Latest trade for {ticker}: {latest_trade}")
-                        # Create a synthetic bar from the latest trade
-                        stock_data = {
-                            'price': latest_trade.price,
-                            'change': 0,  # We don't have previous data
-                            'volume': latest_trade.size,
-                            'avg_volume': None,
+            # Initialize stock data with defaults
+            stock_data = self._create_empty_stock_data()
+            
+            # Try multiple approaches to get stock data
+            data_found = False
+            
+            # Approach 1: Try to get latest market data using the Alpaca API get_bars method
+            if self.api and not data_found:
+                try:
+                    print(f"Approach 1: Trying to get bars for {ticker}...")
+                    bars = self.api.get_bars(ticker, '1Day', limit=5).df
+                    
+                    if not bars.empty:
+                        print(f"Got bar data for {ticker}: {bars.iloc[-1].to_dict()}")
+                        latest_bar = bars.iloc[-1]
+                        
+                        # Get previous day's close for calculating change
+                        if len(bars) > 1:
+                            prev_close = bars.iloc[-2]['close']
+                        else:
+                            try:
+                                yesterday = datetime.now() - timedelta(days=5)  # Look back 5 days to find a trading day
+                                yesterday_bars = self.api.get_bars(ticker, '1Day', 
+                                                                start=yesterday.strftime('%Y-%m-%d'),
+                                                                limit=1).df
+                                prev_close = yesterday_bars.iloc[-1]['close'] if not yesterday_bars.empty else latest_bar['close']
+                            except Exception as prev_error:
+                                print(f"Error getting previous day data for {ticker}: {prev_error}")
+                                prev_close = latest_bar['close']
+                        
+                        change_pct = ((latest_bar['close'] - prev_close) / prev_close) * 100 if prev_close else 0
+                        
+                        # Get 52-week high/low
+                        try:
+                            year_ago = datetime.now() - timedelta(days=365)
+                            yearly_bars = self.api.get_bars(ticker, '1Day', 
+                                                        start=year_ago.strftime('%Y-%m-%d')).df
+                            
+                            high_52w = yearly_bars['high'].max() if not yearly_bars.empty else None
+                            low_52w = yearly_bars['low'].min() if not yearly_bars.empty else None
+                            avg_volume = yearly_bars['volume'].mean() if not yearly_bars.empty else None
+                        except Exception as yearly_error:
+                            print(f"Error getting yearly data for {ticker}: {yearly_error}")
+                            high_52w = None
+                            low_52w = None
+                            avg_volume = latest_bar['volume'] if 'volume' in latest_bar else None
+                        
+                        # Update stock data with real values
+                        stock_data.update({
+                            'price': latest_bar['close'],
+                            'change': change_pct,
+                            'volume': latest_bar['volume'],
+                            'avg_volume': avg_volume,
                             'market_cap': None,
                             'beta': None,
                             'pe_ratio': None,
-                            '52w_high': None,
-                            '52w_low': None
-                        }
-                        return stock_data
-                    else:
-                        print(f"No alternative method available for {ticker}")
-                        return self._create_empty_stock_data()
-                
-                print(f"Got bar data for {ticker}: {bars.iloc[-1].to_dict()}")
-                latest_bar = bars.iloc[-1]
-                
-                # Get previous day's close for calculating change
+                            '52w_high': high_52w,
+                            '52w_low': low_52w,
+                            'name': asset_info['name'] if asset_info else None
+                        })
+                        
+                        data_found = True
+                        print(f"Successfully fetched stock data for {ticker}: price=${stock_data['price']}")
+                except Exception as bars_error:
+                    print(f"Approach 1 failed - Error getting bar data for {ticker}: {bars_error}")
+            
+            # Approach 2: Try getting the latest trade if available
+            if self.api and not data_found and hasattr(self.api, 'get_latest_trade'):
                 try:
-                    yesterday = datetime.now() - timedelta(days=1)
-                    yesterday_bars = self.api.get_bars(ticker, '1Day', 
-                                                    start=yesterday.strftime('%Y-%m-%d'),
-                                                    limit=1).df
-                    prev_close = yesterday_bars.iloc[-1]['close'] if not yesterday_bars.empty else latest_bar['close']
-                    change_pct = ((latest_bar['close'] - prev_close) / prev_close) * 100
-                except Exception as prev_error:
-                    print(f"Error getting previous day data for {ticker}: {prev_error}")
-                    change_pct = 0
-                
-                # Get 52-week high/low
-                try:
-                    year_ago = datetime.now() - timedelta(days=365)
-                    yearly_bars = self.api.get_bars(ticker, '1Day', 
-                                                start=year_ago.strftime('%Y-%m-%d')).df
+                    print(f"Approach 2: Trying to get latest trade for {ticker}...")
+                    latest_trade = self.api.get_latest_trade(ticker)
+                    print(f"Latest trade for {ticker}: {latest_trade}")
                     
-                    high_52w = yearly_bars['high'].max() if not yearly_bars.empty else None
-                    low_52w = yearly_bars['low'].min() if not yearly_bars.empty else None
-                    avg_volume = yearly_bars['volume'].mean() if not yearly_bars.empty else None
-                except Exception as yearly_error:
-                    print(f"Error getting yearly data for {ticker}: {yearly_error}")
-                    high_52w = None
-                    low_52w = None
-                    avg_volume = None
-                
-                # Create stock data dictionary
-                stock_data = {
-                    'price': latest_bar['close'],
-                    'change': change_pct,
-                    'volume': latest_bar['volume'],
-                    'avg_volume': avg_volume,
-                    'market_cap': None,  # Not directly available from Alpaca
-                    'beta': None,  # Not directly available from Alpaca
-                    'pe_ratio': None,  # Not directly available from Alpaca
-                    '52w_high': high_52w,
-                    '52w_low': low_52w
-                }
-                
-                print(f"Successfully fetched stock data for {ticker}: price=${stock_data['price']}")
-                return stock_data
-                
-            except Exception as bars_error:
-                print(f"Error getting bar data for {ticker}: {bars_error}")
-                
-                # Try using direct REST API call as a fallback
+                    # Create a data dictionary from the latest trade
+                    stock_data.update({
+                        'price': latest_trade.price,
+                        'change': 0,  # We don't have previous data
+                        'volume': latest_trade.size,
+                        'name': asset_info['name'] if asset_info else None
+                    })
+                    
+                    data_found = True
+                    print(f"Successfully fetched latest trade data for {ticker}")
+                except Exception as trade_error:
+                    print(f"Approach 2 failed - Error getting latest trade for {ticker}: {trade_error}")
+            
+            # Approach 3: Direct REST API call for latest bar
+            if self.trader and not data_found:
                 try:
-                    print(f"Trying direct API call for {ticker}...")
-                    # Use the requests module to make a direct API call
+                    print(f"Approach 3: Trying direct REST API call for {ticker}...")
+                    # Use the requests module to make a direct API call for latest bar
                     url = f"{self.trader.data_url}/v2/stocks/{ticker}/bars/latest"
                     headers = {
                         'APCA-API-KEY-ID': self.trader.api_key,
@@ -227,33 +322,73 @@ class OptionsMonitor:
                     response = requests.get(url, headers=headers)
                     if response.status_code == 200:
                         data = response.json()
-                        print(f"Direct API response for {ticker}: {data}")
+                        print(f"Direct API response for latest bar: {data}")
                         
                         if 'bar' in data:
                             bar = data['bar']
-                            stock_data = {
+                            stock_data.update({
                                 'price': bar.get('c', None),  # close price
                                 'change': 0,  # We don't have previous data
                                 'volume': bar.get('v', None),  # volume
-                                'avg_volume': None,
-                                'market_cap': None,
-                                'beta': None,
-                                'pe_ratio': None,
-                                '52w_high': None,
-                                '52w_low': None
-                            }
-                            print(f"Successfully fetched stock data via direct API for {ticker}")
-                            return stock_data
+                                'name': asset_info['name'] if asset_info else None
+                            })
+                            
+                            data_found = True
+                            print(f"Successfully fetched stock data via direct bar API for {ticker}")
+                    else:
+                        print(f"Direct bar API call failed: {response.status_code} - {response.text}")
+                except Exception as direct_bar_error:
+                    print(f"Approach 3 failed - Error with direct bar API call: {direct_bar_error}")
+            
+            # Approach 4: Direct REST API call for latest quote
+            if self.trader and not data_found:
+                try:
+                    print(f"Approach 4: Trying direct REST API call for latest quote...")
+                    url = f"{self.trader.data_url}/v2/stocks/{ticker}/quotes/latest"
+                    headers = {
+                        'APCA-API-KEY-ID': self.trader.api_key,
+                        'APCA-API-SECRET-KEY': self.trader.api_secret
+                    }
                     
-                    print(f"Direct API call failed for {ticker}: {response.status_code} - {response.text}")
-                except Exception as direct_error:
-                    print(f"Error with direct API call for {ticker}: {direct_error}")
-                
-                # If all methods fail, return empty data
+                    response = requests.get(url, headers=headers)
+                    if response.status_code == 200:
+                        data = response.json()
+                        print(f"Direct API response for latest quote: {data}")
+                        
+                        if 'quote' in data:
+                            quote = data['quote']
+                            # Use midpoint of bid and ask
+                            price = (quote.get('ap', 0) + quote.get('bp', 0)) / 2 if quote.get('ap') and quote.get('bp') else None
+                            if not price and quote.get('ap'):
+                                price = quote.get('ap')
+                            elif not price and quote.get('bp'):
+                                price = quote.get('bp')
+                                
+                            stock_data.update({
+                                'price': price,
+                                'change': 0,  # We don't have previous data
+                                'volume': None,
+                                'name': asset_info['name'] if asset_info else None
+                            })
+                            
+                            data_found = True
+                            print(f"Successfully fetched quote data for {ticker}")
+                    else:
+                        print(f"Direct quote API call failed: {response.status_code} - {response.text}")
+                except Exception as direct_quote_error:
+                    print(f"Approach 4 failed - Error with direct quote API call: {direct_quote_error}")
+            
+            # If we at least have some basic data, return it
+            if data_found and stock_data['price']:
+                return stock_data
+            else:
+                print(f"All approaches failed for {ticker}. Returning empty data.")
                 return self._create_empty_stock_data()
         
         except Exception as e:
-            print(f"Error fetching stock data for {ticker} from Alpaca: {e}")
+            print(f"Unexpected error fetching stock data for {ticker}: {e}")
+            import traceback
+            traceback.print_exc()
             return self._create_empty_stock_data()
     
     def _create_empty_stock_data(self):
@@ -369,92 +504,109 @@ class OptionsMonitor:
             
             print(f"Fetching option expirations for {ticker}...")
             
-            # Use Alpaca API to get option chain data
-            url = f"{self.trader.data_url}/v1beta1/options/snapshots/{ticker}"
-            headers = {
-                'APCA-API-KEY-ID': self.trader.api_key,
-                'APCA-API-SECRET-KEY': self.trader.api_secret
-            }
+            # Try multiple approaches to get expirations
             
-            # Use the requests module to make the API call
-            print(f"Making API request to {url}")
-            response = requests.get(
-                url,
-                headers=headers,
-                params={
-                    'feed': 'indicative',  # Use indicative feed if no subscription
-                    'limit': 100
+            # Approach 1: Get expiration dates from the options snapshots
+            try:
+                # Use Alpaca API to get option chain data
+                url = f"{self.trader.data_url}/v1beta1/options/snapshots/{ticker}"
+                headers = {
+                    'APCA-API-KEY-ID': self.trader.api_key,
+                    'APCA-API-SECRET-KEY': self.trader.api_secret
                 }
-            )
-            
-            # Check if the request was successful
-            if response.status_code != 200:
-                print(f"Error fetching options data for {ticker}: {response.status_code} - {response.text}")
-                return self._generate_sample_expirations()
-            
-            # Parse the response
-            data = response.json()
-            print(f"Received options data for {ticker} with {len(data)} contracts")
-            
-            # Extract unique expiration dates from the options data
-            expirations = set()
-            for symbol, snapshot in data.items():
-                # Extract expiration date from the symbol or details
-                if 'details' in snapshot and 'expiration_date' in snapshot['details']:
-                    expirations.add(snapshot['details']['expiration_date'])
-            
-            # If we couldn't get any expirations, try an alternative approach
-            if not expirations:
-                print(f"No expirations found for {ticker} in snapshot data, trying alternative approach")
                 
-                # Try to get a list of available expirations directly
-                try:
-                    # Try using the REST API to get available expirations
-                    url = f"{self.trader.data_url}/v1beta1/options/contracts"
-                    params = {
-                        'underlying_symbol': ticker,
+                # Use the requests module to make the API call
+                print(f"Making API request to {url}")
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params={
+                        'feed': 'indicative',  # Use indicative feed if no subscription
                         'limit': 100
                     }
-                    
-                    print(f"Making API request to {url} for contracts")
-                    response = requests.get(url, headers=headers, params=params)
-                    
-                    if response.status_code == 200:
-                        contracts_data = response.json()
-                        print(f"Received contracts data with {len(contracts_data)} items")
-                        
-                        # Extract unique expiration dates
-                        for contract in contracts_data:
-                            if 'expiration_date' in contract:
-                                expirations.add(contract['expiration_date'])
-                except Exception as e:
-                    print(f"Alternative approach failed: {e}")
+                )
                 
-                # If still no expirations, return sample data
-                if not expirations:
-                    print(f"No expirations found for {ticker} using alternative approach")
-                    return self._generate_sample_expirations()
+                # Check if the request was successful
+                if response.status_code == 200:
+                    data = response.json()
+                    print(f"Received options data for {ticker} with {len(data)} contracts")
+                    
+                    # Extract unique expiration dates from the options data
+                    expirations = set()
+                    for symbol, snapshot in data.items():
+                        # Extract expiration date from the symbol or details
+                        if 'details' in snapshot and 'expiration_date' in snapshot['details']:
+                            expirations.add(snapshot['details']['expiration_date'])
+                    
+                    if expirations:
+                        sorted_expirations = sorted(list(expirations))
+                        print(f"Found {len(sorted_expirations)} expiration dates using snapshots")
+                        return sorted_expirations
+                    else:
+                        print("No expirations found in snapshots data")
+                else:
+                    print(f"Error in snapshots request: {response.status_code} - {response.text}")
+            except Exception as e:
+                print(f"Error in snapshots approach: {e}")
             
-            # Sort the expiration dates
-            sorted_expirations = sorted(list(expirations))
-            
-            print(f"Found {len(sorted_expirations)} expiration dates for {ticker}: {sorted_expirations}")
-            return sorted_expirations
+            # Approach 2: Use the contracts endpoint
+            try:
+                url = f"{self.trader.data_url}/v1beta1/options/contracts"
+                headers = {
+                    'APCA-API-KEY-ID': self.trader.api_key,
+                    'APCA-API-SECRET-KEY': self.trader.api_secret
+                }
+                params = {
+                    'underlying_symbol': ticker,
+                    'limit': 500
+                }
+                
+                print(f"Making API request to {url} for contracts")
+                response = requests.get(url, headers=headers, params=params)
+                
+                if response.status_code == 200:
+                    contracts_data = response.json()
+                    print(f"Received contracts data with {len(contracts_data)} items")
+                    
+                    # Extract unique expiration dates
+                    expirations = set()
+                    for contract in contracts_data:
+                        if 'expiration_date' in contract:
+                            expirations.add(contract['expiration_date'])
+                    
+                    if expirations:
+                        sorted_expirations = sorted(list(expirations))
+                        print(f"Found {len(sorted_expirations)} expiration dates using contracts endpoint")
+                        return sorted_expirations
+                    else:
+                        print("No expirations found in contracts data")
+                else:
+                    print(f"Error in contracts request: {response.status_code} - {response.text}")
+            except Exception as e:
+                print(f"Error in contracts approach: {e}")
+                
+            # Approach 3: Use the alpaca_trade_api
+            try:
+                # Try to use the API directly if available
+                if hasattr(self.api, 'get_option_chain'):
+                    chain = self.api.get_option_chain(ticker)
+                    if chain and 'expirations' in chain:
+                        expirations = chain['expirations']
+                        print(f"Found {len(expirations)} expiration dates using API chain")
+                        return sorted(expirations)
+                    else:
+                        print("No expirations found in API chain")
+            except Exception as e:
+                print(f"Error in API approach: {e}")
+                
+            # If all approaches failed, generate sample dates
+            print(f"All approaches failed to get expiration dates for {ticker}")
+            return self._generate_sample_expirations()
             
         except Exception as e:
             print(f"Error getting option expirations for {ticker}: {e}")
             return self._generate_sample_expirations()
-    
-    def _generate_sample_expirations(self):
-        """Generate sample expiration dates for testing"""
-        today = datetime.now()
-        expirations = [
-            (today + timedelta(days=i*7)).strftime('%Y-%m-%d')
-            for i in range(1, 5)  # Next 4 weeks
-        ]
-        print(f"Using sample expiration dates: {expirations}")
-        return expirations
-    
+            
     def _get_option_chain(self, ticker, expiration):
         """Get options chain for a ticker and expiration date using Alpaca API"""
         try:
@@ -465,111 +617,134 @@ class OptionsMonitor:
             
             print(f"Fetching options chain for {ticker} at {expiration}...")
             
-            # Use Alpaca API to get option chain data
-            url = f"{self.trader.data_url}/v1beta1/options/snapshots/{ticker}"
-            headers = {
-                'APCA-API-KEY-ID': self.trader.api_key,
-                'APCA-API-SECRET-KEY': self.trader.api_secret
-            }
+            # Try multiple approaches to get the options chain
             
-            # Use the requests module to make the API call
-            print(f"Making API request to {url} for options chain")
-            response = requests.get(
-                url,
-                headers=headers,
-                params={
-                    'feed': 'indicative',  # Use indicative feed if no subscription
-                    'expiration_date': expiration,
-                    'limit': 1000  # Request a large number to get all strikes
-                }
-            )
-            
-            # Check if the request was successful
-            if response.status_code != 200:
-                print(f"Error fetching options chain for {ticker} at {expiration}: {response.status_code} - {response.text}")
-                return self._generate_sample_options(ticker, expiration)
-            
-            # Parse the response
-            data = response.json()
-            print(f"Received options chain data for {ticker} at {expiration} with {len(data)} contracts")
-            
-            # Separate calls and puts
-            calls = []
-            puts = []
-            
-            for symbol, snapshot in data.items():
-                if 'details' not in snapshot:
-                    continue
-                
-                details = snapshot['details']
-                
-                # Skip if not matching the requested expiration date
-                if details.get('expiration_date') != expiration:
-                    continue
-                
-                greeks = snapshot.get('greeks', {})
-                quote = snapshot.get('quote', {})
-                trade = snapshot.get('trade', {})
-                
-                # Skip if missing essential data
-                if 'strike_price' not in details or 'type' not in details:
-                    continue
-                
-                # Create option contract data
-                contract = {
-                    'symbol': symbol,
-                    'strike': float(details['strike_price']),
-                    'expiration': details.get('expiration_date', expiration),
-                    'lastPrice': float(trade.get('price', 0)) if trade else 0,
-                    'bid': float(quote.get('bid_price', 0)) if quote else 0,
-                    'ask': float(quote.get('ask_price', 0)) if quote else 0,
-                    'volume': int(trade.get('volume', 0)) if trade else 0,
-                    'openInterest': int(details.get('open_interest', 0)) if details.get('open_interest') else 0,
-                    'impliedVolatility': float(greeks.get('implied_volatility', 0)) if greeks else 0,
-                    'delta': float(greeks.get('delta', 0)) if greeks else 0,
-                    'gamma': float(greeks.get('gamma', 0)) if greeks else 0,
-                    'theta': float(greeks.get('theta', 0)) if greeks else 0,
-                    'vega': float(greeks.get('vega', 0)) if greeks else 0
+            # Approach 1: Get option chain from snapshots
+            try:
+                # Use Alpaca API to get option chain data
+                url = f"{self.trader.data_url}/v1beta1/options/snapshots/{ticker}"
+                headers = {
+                    'APCA-API-KEY-ID': self.trader.api_key,
+                    'APCA-API-SECRET-KEY': self.trader.api_secret
                 }
                 
-                # Add to appropriate list
-                if details['type'].lower() == 'call':
-                    calls.append(contract)
-                elif details['type'].lower() == 'put':
-                    puts.append(contract)
-            
-            # If we couldn't get any options data, try an alternative approach
-            if not calls and not puts:
-                print(f"No options data found for {ticker} at {expiration}, trying alternative approach")
-                
-                # Try to get options data using a different endpoint
-                try:
-                    url = f"{self.trader.data_url}/v1beta1/options/contracts"
-                    params = {
-                        'underlying_symbol': ticker,
+                # Use the requests module to make the API call
+                print(f"Making API request to {url} for options chain")
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params={
+                        'feed': 'indicative',  # Use indicative feed if no subscription
                         'expiration_date': expiration,
-                        'limit': 1000
+                        'limit': 1000  # Request a large number to get all strikes
                     }
+                )
+                
+                # Check if the request was successful
+                if response.status_code == 200:
+                    data = response.json()
+                    print(f"Received options chain data for {ticker} at {expiration} with {len(data)} contracts")
                     
-                    print(f"Making API request to {url} for contracts")
-                    contracts_response = requests.get(url, headers=headers, params=params)
+                    # Separate calls and puts
+                    calls = []
+                    puts = []
                     
-                    if contracts_response.status_code == 200:
-                        contracts_data = contracts_response.json()
-                        print(f"Received contracts data with {len(contracts_data)} items")
+                    for symbol, snapshot in data.items():
+                        if not snapshot or 'details' not in snapshot:
+                            continue
                         
-                        # Get contract symbols
-                        contract_symbols = [contract['symbol'] for contract in contracts_data]
+                        details = snapshot['details']
                         
-                        if contract_symbols:
+                        # Skip if not matching the requested expiration date
+                        if details.get('expiration_date') != expiration:
+                            continue
+                        
+                        greeks = snapshot.get('greeks', {})
+                        quote = snapshot.get('quote', {})
+                        trade = snapshot.get('trade', {})
+                        
+                        # Skip if missing essential data
+                        if 'strike_price' not in details or 'type' not in details:
+                            continue
+                        
+                        # Create option contract data
+                        contract = {
+                            'symbol': symbol,
+                            'strike': float(details['strike_price']),
+                            'expiration': details.get('expiration_date', expiration),
+                            'lastPrice': float(trade.get('price', 0)) if trade else 0,
+                            'bid': float(quote.get('bid_price', 0)) if quote else 0,
+                            'ask': float(quote.get('ask_price', 0)) if quote else 0,
+                            'volume': int(trade.get('volume', 0)) if trade else 0,
+                            'openInterest': int(details.get('open_interest', 0)) if details.get('open_interest') else 0,
+                            'impliedVolatility': float(greeks.get('implied_volatility', 0)) if greeks else 0,
+                            'delta': float(greeks.get('delta', 0)) if greeks else 0,
+                            'gamma': float(greeks.get('gamma', 0)) if greeks else 0,
+                            'theta': float(greeks.get('theta', 0)) if greeks else 0,
+                            'vega': float(greeks.get('vega', 0)) if greeks else 0,
+                            'type': details['type'].lower()
+                        }
+                        
+                        # Add to appropriate list
+                        if details['type'].lower() == 'call':
+                            calls.append(contract)
+                        elif details['type'].lower() == 'put':
+                            puts.append(contract)
+                    
+                    if calls or puts:
+                        print(f"Found {len(calls)} calls and {len(puts)} puts using snapshots")
+                        return calls, puts
+                    else:
+                        print("No options found in snapshots data")
+                else:
+                    print(f"Error in snapshots request: {response.status_code} - {response.text}")
+            except Exception as e:
+                print(f"Error in snapshots approach: {e}")
+                
+            # Approach 2: Use the contracts endpoint
+            try:
+                url = f"{self.trader.data_url}/v1beta1/options/contracts"
+                headers = {
+                    'APCA-API-KEY-ID': self.trader.api_key,
+                    'APCA-API-SECRET-KEY': self.trader.api_secret
+                }
+                params = {
+                    'underlying_symbol': ticker,
+                    'expiration_date': expiration,
+                    'limit': 500
+                }
+                
+                print(f"Making API request to {url} for contracts")
+                contracts_response = requests.get(url, headers=headers, params=params)
+                
+                if contracts_response.status_code == 200:
+                    contracts_data = contracts_response.json()
+                    print(f"Received contracts data with {len(contracts_data)} items")
+                    
+                    if not contracts_data:
+                        print("No contracts found")
+                        return self._generate_sample_options(ticker, expiration)
+                    
+                    # Get contract symbols
+                    contract_symbols = [contract['symbol'] for contract in contracts_data]
+                    
+                    if contract_symbols:
+                        # Group symbols into batches to avoid URL length limits
+                        batch_size = 100
+                        calls = []
+                        puts = []
+                        
+                        for i in range(0, len(contract_symbols), batch_size):
+                            batch = contract_symbols[i:i+batch_size]
+                            
                             # Get snapshots for these symbols
                             snapshots_url = f"{self.trader.data_url}/v1beta1/options/snapshots"
                             snapshots_params = {
-                                'symbols': ','.join(contract_symbols[:100]),  # API limit
+                                'symbols': ','.join(batch),
                                 'feed': 'indicative'
                             }
                             
-                            print(f"Making API request to {snapshots_url} for snapshots")
+                            print(f"Making API request to {snapshots_url} for batch {i//batch_size + 1} with {len(batch)} symbols")
                             snapshots_response = requests.get(snapshots_url, headers=headers, params=snapshots_params)
                             
                             if snapshots_response.status_code == 200:
@@ -578,7 +753,7 @@ class OptionsMonitor:
                                 
                                 # Process snapshots
                                 for symbol, snapshot in snapshots_data.items():
-                                    if 'details' not in snapshot:
+                                    if not snapshot or 'details' not in snapshot:
                                         continue
                                     
                                     details = snapshot['details']
@@ -600,7 +775,8 @@ class OptionsMonitor:
                                         'delta': float(greeks.get('delta', 0)) if greeks else 0,
                                         'gamma': float(greeks.get('gamma', 0)) if greeks else 0,
                                         'theta': float(greeks.get('theta', 0)) if greeks else 0,
-                                        'vega': float(greeks.get('vega', 0)) if greeks else 0
+                                        'vega': float(greeks.get('vega', 0)) if greeks else 0,
+                                        'type': details['type'].lower()
                                     }
                                     
                                     # Add to appropriate list
@@ -608,20 +784,72 @@ class OptionsMonitor:
                                         calls.append(contract)
                                     elif details['type'].lower() == 'put':
                                         puts.append(contract)
-                except Exception as alt_error:
-                    print(f"Alternative approach failed: {alt_error}")
+                            else:
+                                print(f"Error in snapshots batch request: {snapshots_response.status_code} - {snapshots_response.text}")
+                        
+                        if calls or puts:
+                            print(f"Found {len(calls)} calls and {len(puts)} puts using contracts+snapshots approach")
+                            return calls, puts
+                        else:
+                            print("No options found in contracts+snapshots data")
+                else:
+                    print(f"Error in contracts request: {contracts_response.status_code} - {contracts_response.text}")
+            except Exception as e:
+                print(f"Error in contracts approach: {e}")
             
-            # If we still couldn't get any options data, use sample data
-            if not calls and not puts:
-                print(f"No options data found for {ticker} at {expiration}, using sample data")
-                return self._generate_sample_options(ticker, expiration)
-            
-            print(f"Found {len(calls)} calls and {len(puts)} puts for {ticker} at {expiration}")
-            return calls, puts
+            # Approach 3: Use the alpaca_trade_api
+            try:
+                # Try to use the API directly if available
+                if hasattr(self.api, 'get_option_chain'):
+                    print("Using API get_option_chain method")
+                    chain = self.api.get_option_chain(ticker, expiration_date=expiration)
+                    if chain:
+                        calls = [self._format_option_contract(c, 'call') for c in chain.get('calls', [])]
+                        puts = [self._format_option_contract(p, 'put') for p in chain.get('puts', [])]
+                        if calls or puts:
+                            print(f"Found {len(calls)} calls and {len(puts)} puts using API chain")
+                            return calls, puts
+                        else:
+                            print("No options found in API chain")
+            except Exception as e:
+                print(f"Error in API approach: {e}")
+                
+            # If all approaches failed, generate sample data
+            print(f"All approaches failed to get option chain for {ticker} at {expiration}")
+            return self._generate_sample_options(ticker, expiration)
             
         except Exception as e:
             print(f"Error getting option chain for {ticker} at {expiration}: {e}")
             return self._generate_sample_options(ticker, expiration)
+            
+    def _format_option_contract(self, contract_data, option_type):
+        """Format an option contract from API data"""
+        return {
+            'symbol': contract_data.get('symbol', ''),
+            'strike': float(contract_data.get('strike_price', 0)),
+            'expiration': contract_data.get('expiration_date', ''),
+            'lastPrice': float(contract_data.get('last_price', 0)),
+            'bid': float(contract_data.get('bid_price', 0)),
+            'ask': float(contract_data.get('ask_price', 0)),
+            'volume': int(contract_data.get('volume', 0)),
+            'openInterest': int(contract_data.get('open_interest', 0)),
+            'impliedVolatility': float(contract_data.get('implied_volatility', 0)),
+            'delta': float(contract_data.get('delta', 0)),
+            'gamma': float(contract_data.get('gamma', 0)),
+            'theta': float(contract_data.get('theta', 0)),
+            'vega': float(contract_data.get('vega', 0)),
+            'type': option_type
+        }
+    
+    def _generate_sample_expirations(self):
+        """Generate sample expiration dates for testing"""
+        today = datetime.now()
+        expirations = [
+            (today + timedelta(days=i*7)).strftime('%Y-%m-%d')
+            for i in range(1, 5)  # Next 4 weeks
+        ]
+        print(f"Using sample expiration dates: {expirations}")
+        return expirations
     
     def _generate_sample_options(self, ticker, expiration):
         """Generate sample options data for testing"""
@@ -1581,6 +1809,7 @@ def create_dashboard(monitor):
          State("ticker-dropdown", "options")]
     )
     def add_custom_ticker(n_clicks, ticker_input, current_options):
+        """Add a custom ticker to the dropdown options"""
         if not n_clicks or not ticker_input:
             return current_options, ""
         
@@ -1593,55 +1822,86 @@ def create_dashboard(monitor):
         if ticker_input in [opt["value"] for opt in current_options]:
             return current_options, ""
         
-        # Try to validate the ticker using Alpaca API
+        # Try to validate the ticker
         valid_ticker = False
+        company_name = ""
+        
+        # First, try to validate through Alpaca API
         try:
             if monitor.api:
+                print(f"Validating ticker {ticker_input} through Alpaca API")
                 # Try to get asset information from Alpaca
-                asset = monitor.api.get_asset(ticker_input)
-                if asset and asset.tradable:
-                    valid_ticker = True
-                    ticker_input = asset.symbol  # Use the official symbol
+                try:
+                    asset = monitor.api.get_asset(ticker_input)
+                    if asset and asset.tradable:
+                        valid_ticker = True
+                        ticker_input = asset.symbol  # Use the official symbol
+                        company_name = asset.name if hasattr(asset, 'name') else ""
+                        print(f"Validated ticker {ticker_input} ({company_name})")
+                except Exception as asset_error:
+                    print(f"Asset {ticker_input} not found directly: {asset_error}")
+                
+                # If the exact ticker isn't found, try to search for similar tickers
+                if not valid_ticker:
+                    try:
+                        # Get a list of assets and filter for similar names or symbols
+                        assets = monitor.api.list_assets(status='active')
+                        # Filter for stocks
+                        stock_assets = [a for a in assets if a.asset_class == 'us_equity']
+                        
+                        # Look for exact or partial matches
+                        matches = [a for a in stock_assets if 
+                                  ticker_input.upper() in a.symbol.upper() or 
+                                  (hasattr(a, 'name') and a.name and ticker_input.upper() in a.name.upper())]
+                        
+                        # Sort by length of symbol (shorter is better)
+                        matches.sort(key=lambda a: len(a.symbol))
+                        
+                        if matches:
+                            valid_ticker = True
+                            ticker_input = matches[0].symbol
+                            company_name = matches[0].name if hasattr(matches[0], 'name') else ""
+                            
+                            # Print suggestions
+                            if len(matches) > 1:
+                                suggestions = ", ".join([f"{a.symbol}" for a in matches[1:5]])
+                                print(f"Found multiple matches. Selected {ticker_input}. Other options: {suggestions}")
+                            else:
+                                print(f"Found match: {ticker_input} ({company_name})")
+                    except Exception as search_error:
+                        print(f"Error searching for similar tickers: {search_error}")
             else:
-                # If no API connection, just accept the ticker (will be validated on data fetch)
-                valid_ticker = True
+                # If no API connection, accept the ticker if format is reasonable
+                if ticker_input and len(ticker_input) <= 5 and ticker_input.isalpha():
+                    valid_ticker = True
+                    print(f"No API connection. Accepting ticker {ticker_input} based on format")
         except Exception as e:
             print(f"Error validating ticker {ticker_input}: {e}")
-            # If the exact ticker isn't found, try to search for similar tickers or company names
-            try:
-                if monitor.api:
-                    # Get a list of assets and filter for similar names
-                    assets = monitor.api.list_assets(status='active')
-                    # Filter for stocks that contain the input in their symbol or name
-                    matches = [a for a in assets if 
-                              ticker_input in a.symbol or 
-                              (hasattr(a, 'name') and a.name and ticker_input.lower() in a.name.lower())]
-                    
-                    if matches:
-                        # Use the first match
-                        ticker_input = matches[0].symbol
-                        valid_ticker = True
-            except Exception as search_error:
-                print(f"Error searching for similar tickers: {search_error}")
         
-        if not valid_ticker:
-            # If we couldn't validate, still try to add it but print a warning
-            print(f"Warning: Could not validate ticker {ticker_input}, but adding it anyway")
+        # If we still couldn't validate but format is reasonable, accept it
+        if not valid_ticker and ticker_input and len(ticker_input) <= 5 and ticker_input.isalpha():
+            print(f"Accepting ticker {ticker_input} based on format")
+            valid_ticker = True
         
-        # Add ticker to monitor
-        if ticker_input not in monitor.tickers:
-            monitor.tickers.append(ticker_input)
-            # Trigger data fetch for the new ticker
-            try:
-                monitor.data[ticker_input] = monitor.fetch_stock_data(ticker_input)
-                monitor.options_data[ticker_input] = monitor.fetch_options_data(ticker_input)
-            except Exception as e:
-                print(f"Error fetching data for new ticker {ticker_input}: {e}")
-        
-        # Update dropdown options
-        new_options = current_options + [{"label": ticker_input, "value": ticker_input}]
-        
-        return new_options, ""
+        if valid_ticker:
+            # Use the monitor.add_ticker method to add the ticker and fetch its data
+            success = monitor.add_ticker(ticker_input)
+            
+            if success:
+                # Create label with company name if available
+                label = f"{ticker_input}"
+                if company_name:
+                    label = f"{ticker_input} - {company_name}"
+                
+                # Update dropdown options
+                new_options = current_options + [{"label": label, "value": ticker_input}]
+                return new_options, ""
+            else:
+                print(f"Failed to add ticker {ticker_input} to watchlist")
+                return current_options, ticker_input
+        else:
+            print(f"Invalid ticker: {ticker_input}. Please try a different symbol.")
+            return current_options, ticker_input
     
     # Update the app.callback for the options chain to match the UI in the image
     @app.callback(
@@ -2414,7 +2674,7 @@ def main():
     parser = argparse.ArgumentParser(description='Options Monitor Dashboard')
     parser.add_argument('--tickers', type=str, default='AAPL,MSFT,GOOGL,AMZN,TSLA',
                         help='Comma-separated list of stock tickers to monitor')
-    parser.add_argument('--refresh', type=int, default=60,
+    parser.add_argument('--refresh', type=int, default=30,
                         help='Data refresh interval in seconds')
     parser.add_argument('--port', type=int, default=8050,
                         help='Port to run the dashboard on')
@@ -2428,15 +2688,25 @@ def main():
     
     print(f"Starting Options Monitor Dashboard with tickers: {', '.join(tickers)}")
     print(f"Data will refresh every {args.refresh} seconds")
+    print(f"Debug mode: {'Enabled' if args.debug else 'Disabled'}")
     
-    monitor = OptionsMonitor(tickers, refresh_interval=args.refresh)
+    # Create monitor instance with debug mode
+    monitor = OptionsMonitor(tickers=tickers, debug=args.debug)
+    
+    # Update refresh interval
+    monitor.refresh_interval = args.refresh
     
     try:
         start_dashboard(monitor, port=args.port, debug=args.debug)
     except KeyboardInterrupt:
         print("\nShutting down...")
+        # Save configuration before exiting
+        monitor._save_config()
+        print("Configuration saved.")
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
